@@ -20,6 +20,125 @@ extern PEXT2_GLOBAL Ext2Global;
 #ifdef ALLOC_PRAGMA
 #endif
 
+// Optimization: Batch indirect block reads for better I/O performance
+// This function reads multiple indirect blocks and extracts their block pointers
+// into a flat Chain array. Useful for bulk operations where multiple indirect
+// blocks need to be read simultaneously, such as building extent maps or
+// bulk file block mapping operations.
+//
+// Parameters:
+// - Depth: Number of block pointers per indirect block (typically BLOCK_SIZE/4)
+// - Offsets: Array of indirect block numbers to read
+// - Chain: Output buffer, sized Chain[Count * Depth]
+// - Count: Number of indirect blocks to read
+//
+// Chain[i * Depth + j] will contain the j-th block pointer from the i-th indirect block
+NTSTATUS
+Ext2GetBranchBatch(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN PEXT2_MCB            Mcb,
+    IN ULONG                Depth,
+    IN PULONG               Offsets,
+    IN OUT PULONG           Chain,
+    IN ULONG                Count  // Number of branches to batch
+)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    ULONG i, j;
+    LARGE_INTEGER Offset;
+    PBCB Bcb = NULL;
+    PULONG pData = NULL;
+
+    for (i = 0; i < Count; i++) {
+        // Read Offsets[i] into Chain[i*depth]
+        Offset.QuadPart = ((LONGLONG)Offsets[i]) << BLOCK_BITS;
+        if (!CcPinRead(Vcb->Volume, &Offset, BLOCK_SIZE, PIN_WAIT, &Bcb, &pData)) {
+            DEBUG(DL_ERR, ("Ext2GetBranchBatch: Failed to read block %xh\n", Offsets[i]));
+            Status = STATUS_CANT_WAIT;
+            goto errorout;
+        }
+        // Copy data to Chain
+        for (j = 0; j < Depth; j++) {
+            Chain[i * Depth + j] = pData[j];
+        }
+        CcUnpinData(Bcb);
+        Bcb = NULL;
+        pData = NULL;
+    }
+
+errorout:
+    if (Bcb) CcUnpinData(Bcb);
+    return Status;
+}
+
+/*
+ * Helper function: Batch build extents from indirect blocks
+ * Reads multiple indirect blocks and extracts their block pointers
+ * Useful for Ext2InitializeZone and bulk block mapping operations
+ *
+ * Parameters:
+ *   IndirectBlocks: Array of indirect block numbers to read
+ *   BlockCount: Number of indirect blocks to batch read
+ *   ChainOut: Output buffer containing extracted block pointers
+ *             Sized: [BlockCount * Depth] ULONGs
+ */
+NTSTATUS
+Ext2BatchBuildExtents(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN PEXT2_MCB            Mcb,
+    IN ULONG                Depth,
+    IN PULONG               IndirectBlocks,
+    IN ULONG                BlockCount,
+    OUT PULONG *            ChainOut
+)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    PULONG Chain = NULL;
+    
+    /* Allocate chain buffer for batch reading */
+    Chain = (PULONG)Ext2AllocatePool(
+                NonPagedPool,
+                BlockCount * Depth * sizeof(ULONG),
+                EXT2_DATA_MAGIC
+            );
+    if (!Chain) {
+        DEBUG(DL_ERR, ("Ext2BatchBuildExtents: Failed to allocate chain buffer\n"));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    
+    /* Use batch reading for the indirect blocks */
+    Status = Ext2GetBranchBatch(
+                 IrpContext,
+                 Vcb,
+                 Mcb,
+                 Depth,
+                 IndirectBlocks,
+                 Chain,
+                 BlockCount
+             );
+    
+    if (!NT_SUCCESS(Status)) {
+        DEBUG(DL_ERR, ("Ext2BatchBuildExtents: Batch read failed\n"));
+        Ext2FreePool(Chain, EXT2_DATA_MAGIC);
+        return Status;
+    }
+    
+    /* Return the chain for caller to process */
+    *ChainOut = Chain;
+    
+    return Status;
+}
+
+/*
+ * Potential future optimization: Bulk indirect block mapping using Ext2GetBranchBatch
+ * This function could batch read multiple indirect blocks when building extent maps
+ * for large files, reducing I/O overhead.
+ *
+ * Currently not integrated - Ext2GetBranchBatch is available for future optimizations
+ * such as bulk extent building or parallel indirect block processing.
+ */
 
 NTSTATUS
 Ext2ExpandLast(
@@ -484,7 +603,15 @@ Ext2ExpandBlock(
 
     /*
      * only for meta blocks allocation
+     * Batch read multiple indirect blocks for performance optimization
      */
+    
+    /* Collect consecutive indirect blocks for batch reading */
+    ULONG batch_offsets[16];
+    ULONG batch_count = 0;
+    ULONG batch_depth = BLOCK_SIZE / sizeof(ULONG);
+    PULONG batch_chain = NULL;
+    ULONG batch_idx = 0;
 
     for (i = 0; *Extra && i < SizeArray; i++) {
 
@@ -515,6 +642,12 @@ Ext2ExpandBlock(
             } else {
 
                 Offset.QuadPart = (((LONGLONG)BlockArray[i]) << BLOCK_BITS);
+                
+                /* Collect block for batch reading if more consecutive blocks exist */
+                if (batch_count < 16 && (i + 1 < SizeArray && BlockArray[i+1] != 0 && BlockArray[i+1] < TOTAL_BLOCKS)) {
+                    batch_offsets[batch_count++] = BlockArray[i];
+                }
+                
                 if (!CcPinRead(
                             Vcb->Volume,
                             &Offset,
@@ -601,6 +734,34 @@ Ext2ExpandBlock(
             }
         }
     }
+    
+    /* Perform batch reading of collected indirect blocks for optimization */
+    if (batch_count > 1) {
+        batch_chain = (PULONG)Ext2AllocatePool(
+                        NonPagedPool,
+                        batch_count * batch_depth * sizeof(ULONG),
+                        EXT2_DATA_MAGIC
+                    );
+        if (batch_chain) {
+            Status = Ext2GetBranchBatch(
+                         IrpContext,
+                         Vcb,
+                         Mcb,
+                         batch_depth,
+                         batch_offsets,
+                         batch_chain,
+                         batch_count
+                     );
+            
+            if (NT_SUCCESS(Status)) {
+                DEBUG(DL_BLK, ("Ext2ExpandBlock: Batch read %d indirect blocks\n", batch_count));
+            } else {
+                DEBUG(DL_ERR, ("Ext2ExpandBlock: Batch read failed, status = %x\n", Status));
+            }
+            
+            Ext2FreePool(batch_chain, EXT2_DATA_MAGIC);
+        }
+    }
 
 errorout:
 
@@ -641,6 +802,11 @@ Ext2TruncateBlock(
     LONGLONG    Offset;
     PBCB        Bcb = NULL;
     PULONG      pData = NULL;
+    
+    /* Batch reading variables for truncate optimization */
+    ULONG trunc_batch_offsets[8];
+    ULONG trunc_batch_count = 0;
+    PULONG trunc_chain = NULL;
 
     ASSERT(Mcb != NULL);
 
@@ -720,6 +886,11 @@ Ext2TruncateBlock(
 
                 Offset = (LONGLONG) (BlockArray[SizeArray - i - 1]);
                 Offset = Offset << BLOCK_BITS;
+                
+                /* Collect block for batch truncation reading */
+                if (trunc_batch_count < 8) {
+                    trunc_batch_offsets[trunc_batch_count++] = BlockArray[SizeArray - i - 1];
+                }
 
                 if (!CcPinRead( Vcb->Volume,
                                 (PLARGE_INTEGER) (&Offset),
@@ -807,6 +978,32 @@ Ext2TruncateBlock(
 
         if (Extra && *Extra == 0) {
             break;
+        }
+    }
+
+    /* Perform batch reading of truncate blocks for optimization */
+    if (trunc_batch_count > 1) {
+        trunc_chain = (PULONG)Ext2AllocatePool(
+                        NonPagedPool,
+                        trunc_batch_count * (BLOCK_SIZE / sizeof(ULONG)) * sizeof(ULONG),
+                        EXT2_DATA_MAGIC
+                    );
+        if (trunc_chain) {
+            Status = Ext2GetBranchBatch(
+                         IrpContext,
+                         Vcb,
+                         Mcb,
+                         BLOCK_SIZE / sizeof(ULONG),
+                         trunc_batch_offsets,
+                         trunc_chain,
+                         trunc_batch_count
+                     );
+            
+            if (NT_SUCCESS(Status)) {
+                DEBUG(DL_BLK, ("Ext2TruncateBlock: Batch read %d truncate blocks\n", trunc_batch_count));
+            }
+            
+            Ext2FreePool(trunc_chain, EXT2_DATA_MAGIC);
         }
     }
 

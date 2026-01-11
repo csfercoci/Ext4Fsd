@@ -2,7 +2,7 @@
  * COPYRIGHT:        See COPYRIGHT.TXT
  * PROJECT:          Ext2-Ext4 File System Driver for WinXP-Win10
  * FILE:             ext4_csum.c
- * PROGRAMMER:       Bo Brantén <bosse@acc.umu.se>
+ * PROGRAMMER:       Bo Brantï¿½n <bosse@acc.umu.se>
  * HOMEPAGE:         http://www.ext2fsd.com
  * UPDATE HISTORY:
  */
@@ -13,12 +13,43 @@
 #include "linux\ext4.h"
 #include "linux\ext4_xattr.h"
 
+#ifdef __SSE4_2__
+#include <intrin.h>
+#include <nmmintrin.h>
+#include <xmmintrin.h>
+#endif
+
 /* GLOBALS ***************************************************************/
 
 extern PEXT2_GLOBAL Ext2Global;
 
 /* DEFINITIONS *************************************************************/
 
+static int ext4_has_sse42(void)
+{
+    static int has = -1;
+    if (has == -1) {
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 1);
+        has = (cpuInfo[2] & (1 << 20)) != 0;  // SSE4.2 bit
+    }
+    return has;
+}
+
+#ifdef __SSE4_2__
+static __u32 crc32c_hw(__u32 crc, const __u8 *data, unsigned int length)
+{
+    while (length >= 4) {
+        crc = _mm_crc32_u32(crc, *(const __u32 *)data);
+        data += 4;
+        length -= 4;
+    }
+    while (length--) {
+        crc = _mm_crc32_u8(crc, *data++);
+    }
+    return crc;
+}
+#endif
 
 /* FUNCTIONS ***************************************************************/
 
@@ -153,8 +184,16 @@ static const __u32 crc32c_table[256] = {
 
 __u32 crc32c(__u32 crc, const __u8 *data, unsigned int length)
 {
-	while (length--)
+#ifdef __SSE4_2__
+    if (ext4_has_sse42()) {
+        return crc32c_hw(crc, data, length);
+    }
+#endif
+
+	while (length--) {
+		_mm_prefetch(data + 64, _MM_HINT_T0);  // Prefetch for faster access
 		crc = crc32c_table[(crc ^ *data++) & 0xFFL] ^ (crc >> 8);
+	}
 
 	return crc;
 }
@@ -163,6 +202,19 @@ __u32 ext4_chksum(struct ext4_sb_info *sbi, __u32 crc,
 			      const void *buffer, unsigned int length)
 {
     return crc32c(crc, buffer, length);
+}
+
+/*
+ * Batch checksum for multiple buffers (optimization for parallel processing)
+ */
+__u32 ext4_chksum_batch(struct ext4_sb_info *sbi, __u32 crc,
+                        const void **buffers, unsigned int *lengths, int count)
+{
+    int i;
+    for (i = 0; i < count; i++) {
+        crc = crc32c(crc, buffers[i], lengths[i]);
+    }
+    return crc;
 }
 
 /*

@@ -11,6 +11,9 @@
 
 #include "ext2fs.h"
 
+/* external function declarations */
+extern void htree_cache_init(void);
+
 /* GLOBALS ***************************************************************/
 
 PEXT2_GLOBAL    Ext2Global   = NULL;
@@ -493,6 +496,9 @@ DriverEntry (
         goto errorout;
     }
     journal_module_inited = TRUE;
+
+    /* initialize htree cache */
+    htree_cache_init();
 
     /* allocate memory for Ext2Global */
     Ext2Global = Ext2AllocatePool(NonPagedPool, sizeof(EXT2_GLOBAL), 'LG2E');

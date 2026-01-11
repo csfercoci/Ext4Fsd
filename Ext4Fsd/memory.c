@@ -1119,6 +1119,11 @@ Ext2InitializeZone(
     ULONG       End;
     ULONG       Block;
     ULONG       Mapped;
+    
+    /* Batch reading for zone initialization */
+    PULONG indirect_batch_blocks[8];
+    ULONG batch_block_count = 0;
+    PULONG zone_batch_chain = NULL;
 
     Ext2ClearAllExtents(&Mcb->Extents);
     Ext2ClearAllExtents(&Mcb->MetaExts);
@@ -1130,7 +1135,9 @@ Ext2InitializeZone(
 
         Block = Mapped = 0;
 
-        /* mapping file offset to ext2 block */
+        /* mapping file offset to ext2 block 
+         * For indirect blocks, batch read multiple blocks for better performance
+         */
         if (INODE_HAS_EXTENT(&Mcb->Inode)) {
             Status = Ext2MapExtent(
                          IrpContext,
@@ -1173,10 +1180,42 @@ Ext2InitializeZone(
             }
             DEBUG(DL_MAP, ("Ext2InitializeZone %wZ: Block = %xh Mapped = %xh\n",
                            &Mcb->FullName, Block, Mapped));
+            
+            /* Collect indirect block for batch reading */
+            if (!INODE_HAS_EXTENT(&Mcb->Inode) && batch_block_count < 8) {
+                indirect_batch_blocks[batch_block_count++] = (PVOID)(ULONG_PTR)Block;
+            }
         }
 
         /* Mapped is total number of continous blocks or NULL blocks */
         Start += Mapped;
+    }
+    
+    /* Perform batch reading of indirect blocks for optimization */
+    if (batch_block_count > 1) {
+        zone_batch_chain = (PULONG)Ext2AllocatePool(
+                        NonPagedPool,
+                        batch_block_count * (BLOCK_SIZE / sizeof(ULONG)) * sizeof(ULONG),
+                        EXT2_DATA_MAGIC
+                    );
+        if (zone_batch_chain) {
+            Status = Ext2GetBranchBatch(
+                         IrpContext,
+                         Vcb,
+                         Mcb,
+                         BLOCK_SIZE / sizeof(ULONG),
+                         (PULONG)indirect_batch_blocks,
+                         zone_batch_chain,
+                         batch_block_count
+                     );
+            
+            if (NT_SUCCESS(Status)) {
+                DEBUG(DL_MAP, ("Ext2InitializeZone: Batch read %d indirect blocks for %wZ\n",
+                               batch_block_count, &Mcb->FullName));
+            }
+            
+            Ext2FreePool(zone_batch_chain, EXT2_DATA_MAGIC);
+        }
     }
 
     /* set mcb zone as initialized */

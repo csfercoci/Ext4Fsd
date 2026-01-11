@@ -2514,6 +2514,28 @@ Ext2TruncateIndirect(
     PLARGE_INTEGER    Size
 );
 
+NTSTATUS
+Ext2GetBranchBatch(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN PEXT2_MCB            Mcb,
+    IN ULONG                Depth,
+    IN PULONG               Offsets,
+    IN OUT PULONG           Chain,
+    IN ULONG                Count
+);
+
+NTSTATUS
+Ext2BatchBuildExtents(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN PEXT2_MCB            Mcb,
+    IN ULONG                Depth,
+    IN PULONG               IndirectBlocks,
+    IN ULONG                BlockCount,
+    OUT PULONG *            ChainOut
+);
+
 
 //
 // linux.c: linux lib implemenation

@@ -449,6 +449,10 @@ Ext2ReadWriteBlocks(
                     IrpContext->Irp = NULL;
                     Status = STATUS_PENDING;
                 }
+                if (pContext) {
+                    Ext2FreePool(pContext, EXT2_RWC_MAGIC);
+                    DEC_MEM_COUNT(PS_RW_CONTEXT, pContext, sizeof(EXT2_RW_CONTEXT));
+                }
             }
         }
     }
