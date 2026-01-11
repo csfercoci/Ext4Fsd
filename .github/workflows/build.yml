@@ -61,7 +61,7 @@ jobs:
         dir /s /b "*.dll" | findstr /C:"Ext2Fsd.dll"
     
     - name: Upload Driver Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: success()
       with:
         name: Ext4Fsd-${{ matrix.configuration }}-${{ matrix.platform }}
@@ -85,7 +85,7 @@ jobs:
         @ | Out-File -FilePath "build-$platform-$config.txt"
       
     - name: Upload Build Summary
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: build-summary-${{ matrix.platform }}-${{ matrix.configuration }}
@@ -116,7 +116,7 @@ jobs:
           /verbosity:minimal
     
     - name: Upload Ext2Mgr Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: success()
       with:
         name: Ext2Mgr-${{ matrix.configuration }}-${{ matrix.platform }}
@@ -149,7 +149,7 @@ jobs:
           /verbosity:minimal
     
     - name: Upload Ext2Srv Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: success()
       with:
         name: Ext2Srv-${{ matrix.configuration }}-${{ matrix.platform }}
@@ -180,7 +180,7 @@ jobs:
         .\test_ext4_csum.exe || echo "Test completed"
     
     - name: Upload Test Binary
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: success()
       with:
         name: test_ext4_csum
@@ -195,7 +195,7 @@ jobs:
     
     steps:
     - name: Download Build Summaries
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         path: build-summaries
       continue-on-error: true
@@ -233,7 +233,7 @@ jobs:
       uses: actions/checkout@v4
     
     - name: Download All Artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         path: release-artifacts
     
@@ -426,7 +426,7 @@ jobs:
         ls -la | grep -E "^d" | awk '{print "- " $NF}' >> build-summary.md
     
     - name: Upload Summary
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: build-summary
         path: build-summary.md

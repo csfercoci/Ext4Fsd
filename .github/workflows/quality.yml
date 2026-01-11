@@ -154,7 +154,7 @@ jobs:
         echo "- Macros: $(grep -r "^#define" Ext4Fsd --include="*.h" | wc -l)" >> metrics.md
     
     - name: Upload Metrics
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: code-metrics
         path: metrics.md
