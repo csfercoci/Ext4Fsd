@@ -109,8 +109,8 @@ jobs:
         }
         
         if (-not $selectedVersion) {
-          Write-Error "No SDK version found with complete driver development headers (km, um, shared)"
-          Write-Host "`nTrying alternative: Install specific WDK components..."
+          Write-Host "No SDK version found with complete driver development headers"
+          Write-Host "Trying alternative: Install specific WDK components..."
           
           # Fallback: try installing via Chocolatey as last resort
           choco install -y windows-sdk-10.0 --version=10.0.22621.0
