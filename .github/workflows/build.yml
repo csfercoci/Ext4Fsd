@@ -20,6 +20,7 @@ jobs:
       matrix:
         configuration: [Release, Debug]
         platform: [x64, Win32, ARM, ARM64]
+      fail-fast: false
     
     steps:
     - name: Checkout Code
@@ -27,38 +28,86 @@ jobs:
       with:
         fetch-depth: 0
     
+    - name: Check Windows Environment
+      run: |
+        Write-Host "=== Windows Environment Check ==="
+        Write-Host "OS Version: $(Get-WmiObject win32_operatingsystem | select -expand caption)"
+        Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)"
+        Write-Host "Available RAM: $((Get-WmiObject -Class Win32_OperatingSystem).TotalVisibleMemorySize / 1GB) GB"
+        if (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10") {
+          Write-Host "Windows SDK: Found"
+        } else {
+          Write-Host "Windows SDK: NOT FOUND - May need installation"
+        }
+    
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v2
     
     - name: Add NuGet
-      uses: nuget/setup-nuget@v1
+      uses: nuget/setup-nuget@v2
+    
+    - name: Cache NuGet Packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
     
     - name: Restore NuGet Packages
-      run: nuget restore Ext4Fsd.sln
+      run: |
+        nuget restore Ext4Fsd.sln
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "NuGet restore failed with exit code $LASTEXITCODE"
+          exit 1
+        }
     
     - name: Check Platform Support
       run: |
-        echo "Building for platform: ${{ matrix.platform }}"
-        echo "Configuration: ${{ matrix.configuration }}"
+        Write-Host "=== Build Configuration ==="
+        Write-Host "Building for platform: ${{ matrix.platform }}"
+        Write-Host "Configuration: ${{ matrix.configuration }}"
+        
         # Verify platform is available in project file
         if (Select-String -Path Ext4Fsd\Ext4Fsd.vcxproj -Pattern "${{ matrix.platform }}" -Quiet) {
-          echo "Platform ${{ matrix.platform }} found in project"
+          Write-Host "✓ Platform ${{ matrix.platform }} found in project"
         } else {
-          echo "Warning: Platform ${{ matrix.platform }} may not be configured"
+          Write-Error "✗ Platform ${{ matrix.platform }} NOT found in project - build may fail"
         }
     
     - name: Build Solution
       run: |
+        Write-Host "=== Starting MSBuild ==="
         msbuild Ext4Fsd.sln `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:MaxCpuCount=4 `
-          /verbosity:minimal
+          /verbosity:detailed `
+          /fl `
+          /flp:LogFile=msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed
+        
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "MSBuild failed for platform ${{ matrix.platform }} configuration ${{ matrix.configuration }}"
+          exit 1
+        }
+        Write-Host "✓ Build completed successfully for ${{ matrix.platform }} - ${{ matrix.configuration }}"
     
     - name: Check Build Artifacts
       run: |
-        dir /s /b "*.sys" | findstr /C:"Ext2Fsd.sys"
-        dir /s /b "*.dll" | findstr /C:"Ext2Fsd.dll"
+        Write-Host "=== Searching for Build Artifacts ==="
+        $sysFiles = Get-ChildItem -Path . -Recurse -Filter "*.sys" -ErrorAction SilentlyContinue
+        $dllFiles = Get-ChildItem -Path . -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue
+        $pdbFiles = Get-ChildItem -Path . -Recurse -Filter "*.pdb" -ErrorAction SilentlyContinue
+        
+        Write-Host "Found $($sysFiles.Count) .sys files"
+        Write-Host "Found $($dllFiles.Count) .dll files"
+        Write-Host "Found $($pdbFiles.Count) .pdb files"
+        
+        if ($sysFiles.Count -eq 0) {
+          Write-Warning "No .sys files found! Driver build may have failed."
+        } else {
+          $sysFiles | ForEach-Object { Write-Host "  - $($_.FullName)" }
+        }
     
     - name: Upload Driver Artifacts
       uses: actions/upload-artifact@v4
@@ -70,6 +119,15 @@ jobs:
           **/*.dll
           **/*.pdb
         retention-days: 30
+        compression-level: 9
+    
+    - name: Upload MSBuild Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: msbuild-logs-${{ matrix.configuration }}-${{ matrix.platform }}
+        path: msbuild-*.log
+        retention-days: 7
     
     - name: Create Platform Summary
       if: always()
@@ -77,12 +135,20 @@ jobs:
         $platform = "${{ matrix.platform }}"
         $config = "${{ matrix.configuration }}"
         $result = "${{ job.status }}"
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         
         $summary = @"
-        Platform: $platform
-        Configuration: $config
-        Status: $result
-        @ | Out-File -FilePath "build-$platform-$config.txt"
+Build Summary
+=============
+Platform: $platform
+Configuration: $config
+Status: $result
+Timestamp: $timestamp
+Commit: ${{ github.sha }}
+Branch: ${{ github.ref }}
+        "@
+        
+        $summary | Out-File -FilePath "build-$platform-$config.txt"
       
     - name: Upload Build Summary
       uses: actions/upload-artifact@v4
@@ -99,21 +165,30 @@ jobs:
       matrix:
         configuration: [Release, Debug]
         platform: [x64, Win32, ARM, ARM64]
+      fail-fast: false
     
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
     
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v2
     
     - name: Build Ext2Mgr
       run: |
+        Write-Host "Building Ext2Mgr for ${{ matrix.platform }} - ${{ matrix.configuration }}"
         msbuild Ext2Mgr/Ext2Mgr.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:MaxCpuCount=4 `
-          /verbosity:minimal
+          /verbosity:detailed `
+          /fl `
+          /flp:LogFile=msbuild-mgr-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed
+        
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Ext2Mgr build failed"
+          exit 1
+        }
     
     - name: Upload Ext2Mgr Artifacts
       uses: actions/upload-artifact@v4
@@ -124,6 +199,15 @@ jobs:
           **/*.exe
           **/*.pdb
         retention-days: 30
+        compression-level: 9
+    
+    - name: Upload Ext2Mgr Build Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: msbuild-mgr-logs-${{ matrix.configuration }}-${{ matrix.platform }}
+        path: msbuild-mgr-*.log
+        retention-days: 7
 
   build-service:
     name: Build Ext2Srv Service
@@ -132,21 +216,30 @@ jobs:
       matrix:
         configuration: [Release, Debug]
         platform: [x64, Win32, ARM, ARM64]
+      fail-fast: false
     
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
     
     - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v2
     
     - name: Build Ext2Srv
       run: |
+        Write-Host "Building Ext2Srv for ${{ matrix.platform }} - ${{ matrix.configuration }}"
         msbuild Ext2Srv/Ext2Srv.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:MaxCpuCount=4 `
-          /verbosity:minimal
+          /verbosity:detailed `
+          /fl `
+          /flp:LogFile=msbuild-srv-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed
+        
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Ext2Srv build failed"
+          exit 1
+        }
     
     - name: Upload Ext2Srv Artifacts
       uses: actions/upload-artifact@v4
@@ -158,6 +251,15 @@ jobs:
           **/*.dll
           **/*.pdb
         retention-days: 30
+        compression-level: 9
+    
+    - name: Upload Ext2Srv Build Logs
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: msbuild-srv-logs-${{ matrix.configuration }}-${{ matrix.platform }}
+        path: msbuild-srv-*.log
+        retention-days: 7
 
   test-compilation:
     name: Test CRC Compilation
@@ -168,16 +270,28 @@ jobs:
       uses: actions/checkout@v4
     
     - name: Setup Visual Studio Build Tools
-      uses: microsoft/setup-msbuild@v1.1
+      uses: microsoft/setup-msbuild@v2
     
     - name: Compile CRC Test
       run: |
+        Write-Host "=== Compiling CRC Test Program ==="
         cd ${{ github.workspace }}
-        cl test_ext4_csum.c /Fe:test_ext4_csum.exe
+        cl test_ext4_csum.c /Fe:test_ext4_csum.exe /W3
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "CRC test compilation failed"
+          exit 1
+        }
+        Write-Host "✓ CRC test compiled successfully"
     
     - name: Run CRC Test
       run: |
-        .\test_ext4_csum.exe || echo "Test completed"
+        Write-Host "=== Running CRC Test ==="
+        .\test_ext4_csum.exe
+        if ($LASTEXITCODE -ne 0) {
+          Write-Warning "CRC test failed with exit code $LASTEXITCODE"
+        } else {
+          Write-Host "✓ CRC test passed"
+        }
     
     - name: Upload Test Binary
       uses: actions/upload-artifact@v4
@@ -247,134 +361,122 @@ jobs:
         mkdir release-package\docs
         
         # Copy documentation
-        copy CHANGELOG.md release-package\docs\
-        copy README.md release-package\docs\
-        copy IMPROVEMENTS.md release-package\docs\
-        copy DEVELOPMENT.md release-package\docs\
+        if (Test-Path "CHANGELOG.md") { copy CHANGELOG.md release-package\docs\ } else { Write-Host "CHANGELOG.md not found" }
+        if (Test-Path "README.md") { copy README.md release-package\docs\ } else { Write-Host "README.md not found" }
+        if (Test-Path "IMPROVEMENTS.md") { copy IMPROVEMENTS.md release-package\docs\ } else { Write-Host "IMPROVEMENTS.md not found" }
+        if (Test-Path "DEVELOPMENT.md") { copy DEVELOPMENT.md release-package\docs\ } else { Write-Host "DEVELOPMENT.md not found" }
     
     - name: Organize Platform-Specific Artifacts
       run: |
+        Write-Host "=== Organizing Artifacts by Platform ==="
         $artifacts = Get-ChildItem "release-artifacts" -Directory
         
         foreach ($artifact in $artifacts) {
           $name = $artifact.Name
+          Write-Host "Processing: $name"
           
           if ($name -like "*x64*Release*") {
             Copy-Item "$($artifact.FullName)\*" "release-package\x64\" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  -> Copied to x64"
           }
           elseif ($name -like "*Win32*Release*" -or $name -like "*x86*Release*") {
             Copy-Item "$($artifact.FullName)\*" "release-package\x86\" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  -> Copied to x86"
           }
           elseif ($name -like "*ARM64*Release*") {
             Copy-Item "$($artifact.FullName)\*" "release-package\ARM64\" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  -> Copied to ARM64"
           }
           elseif ($name -like "*ARM*Release*") {
             Copy-Item "$($artifact.FullName)\*" "release-package\ARM\" -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "  -> Copied to ARM"
           }
         }
+        
+        Write-Host "=== Verifying Release Package Contents ==="
+        Get-ChildItem -Path release-package -Recurse | ForEach-Object { Write-Host $_.FullName }
     
     - name: Create README for Release
       run: |
         @"
-        # Ext4Fsd Release Package
-        
-        This package contains pre-built binaries for multiple platforms.
-        
-        ## Contents
-        
-        - **x86/** - 32-bit Windows (Windows XP/Vista/7/8/10/11)
-        - **x64/** - 64-bit Windows (Windows Vista/7/8/10/11)
-        - **ARM/** - ARM 32-bit (Windows RT, Surface 2/3)
-        - **ARM64/** - ARM 64-bit (Windows 10/11 on ARM)
-        - **docs/** - Documentation and changelog
-        
-        ## Installation
-        
-        1. Extract the appropriate folder for your platform
-        2. Run the installation program or use the signed driver files
-        3. See docs/README.md for detailed instructions
-        
-        ## System Requirements
-        
-        - Windows XP SP3 or later
-        - Administrator privileges for driver installation
-        
+# Ext4Fsd Release Package
+
+This package contains pre-built binaries for multiple platforms.
+
+## Contents
+
+- **x86/** - 32-bit Windows (Windows Vista/7/8/10/11)
+- **x64/** - 64-bit Windows (Windows Vista/7/8/10/11)
+- **ARM/** - ARM 32-bit (Windows RT, Surface 2/3)
+- **ARM64/** - ARM 64-bit (Windows 10/11 on ARM)
+- **docs/** - Documentation and changelog
+
+## Installation
+
+1. Extract the appropriate folder for your platform
+2. Run the installation program or use the signed driver files
+3. See docs/README.md for detailed instructions
+
+## System Requirements
+
+- Windows Vista SP1 or later
+- Administrator privileges for driver installation
+
+## Release Information
+
+- **Release Date:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+- **Build Version:** ${{ github.ref }}
+- **Commit:** ${{ github.sha }}
+
         "@ | Out-File "release-package\RELEASE_README.txt"
     
     - name: Create ZIP Archives
       run: |
+        Write-Host "=== Creating Release Archives ==="
+        
         # Create comprehensive archive with all platforms
-        powershell -Command "Compress-Archive -Path release-package -DestinationPath Ext4Fsd-Release-Universal.zip -Force"
+        Compress-Archive -Path release-package -DestinationPath Ext4Fsd-Release-Universal.zip -Force -CompressionLevel Optimal
+        Write-Host "✓ Created Ext4Fsd-Release-Universal.zip"
         
         # Create individual platform archives
-        Compress-Archive -Path "release-package\x86" -DestinationPath "Ext4Fsd-Release-x86.zip" -Force
-        Compress-Archive -Path "release-package\x64" -DestinationPath "Ext4Fsd-Release-x64.zip" -Force
-        Compress-Archive -Path "release-package\ARM" -DestinationPath "Ext4Fsd-Release-ARM.zip" -Force
-        Compress-Archive -Path "release-package\ARM64" -DestinationPath "Ext4Fsd-Release-ARM64.zip" -Force
+        if ((Get-ChildItem "release-package\x86" -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
+          Compress-Archive -Path "release-package\x86" -DestinationPath "Ext4Fsd-Release-x86.zip" -Force -CompressionLevel Optimal
+          Write-Host "✓ Created Ext4Fsd-Release-x86.zip"
+        }
         
-        echo "Created release packages:"
-        ls *.zip
+        if ((Get-ChildItem "release-package\x64" -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
+          Compress-Archive -Path "release-package\x64" -DestinationPath "Ext4Fsd-Release-x64.zip" -Force -CompressionLevel Optimal
+          Write-Host "✓ Created Ext4Fsd-Release-x64.zip"
+        }
+        
+        if ((Get-ChildItem "release-package\ARM" -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
+          Compress-Archive -Path "release-package\ARM" -DestinationPath "Ext4Fsd-Release-ARM.zip" -Force -CompressionLevel Optimal
+          Write-Host "✓ Created Ext4Fsd-Release-ARM.zip"
+        }
+        
+        if ((Get-ChildItem "release-package\ARM64" -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
+          Compress-Archive -Path "release-package\ARM64" -DestinationPath "Ext4Fsd-Release-ARM64.zip" -Force -CompressionLevel Optimal
+          Write-Host "✓ Created Ext4Fsd-Release-ARM64.zip"
+        }
+        
+        Write-Host "Release archives created:"
+        Get-ChildItem "*.zip" | ForEach-Object { Write-Host "  - $($_.Name) ($($_.Length / 1MB) MB)" }
     
     - name: Create GitHub Release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Ext4Fsd ${{ github.ref }}
+        files: |
+          Ext4Fsd-Release-Universal.zip
+          Ext4Fsd-Release-x86.zip
+          Ext4Fsd-Release-x64.zip
+          Ext4Fsd-Release-ARM.zip
+          Ext4Fsd-Release-ARM64.zip
         body_path: CHANGELOG.md
         draft: false
         prerelease: false
-    
-    - name: Upload Release Assets
-      uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./Ext4Fsd-Release-Universal.zip
-        asset_name: Ext4Fsd-Release-Universal.zip
-        asset_content_type: application/zip
-    
-    - name: Upload x86 Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./Ext4Fsd-Release-x86.zip
-        asset_name: Ext4Fsd-Release-x86.zip
-        asset_content_type: application/zip
-    
-    - name: Upload x64 Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./Ext4Fsd-Release-x64.zip
-        asset_name: Ext4Fsd-Release-x64.zip
-        asset_content_type: application/zip
-    
-    - name: Upload ARM Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./Ext4Fsd-Release-ARM.zip
-        asset_name: Ext4Fsd-Release-ARM.zip
-        asset_content_type: application/zip
-    
-    - name: Upload ARM64 Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./Ext4Fsd-Release-ARM64.zip
-        asset_name: Ext4Fsd-Release-ARM64.zip
-        asset_content_type: application/zip
 
   code-analysis:
     name: Code Quality Check
@@ -386,24 +488,53 @@ jobs:
     
     - name: Run Code Analysis
       run: |
-        # Simple file count and complexity check
-        echo "Source Files:"
-        dir /s /b Ext4Fsd\*.c | find /c ".c"
-        dir /s /b Ext4Fsd\*.h | find /c ".h"
+        Write-Host "=== Code Complexity Analysis ==="
+        $cFiles = Get-ChildItem -Path Ext4Fsd -Filter "*.c" -Recurse
+        $hFiles = Get-ChildItem -Path Ext4Fsd -Filter "*.h" -Recurse
+        
+        Write-Host "Source Files:"
+        Write-Host "  C files: $($cFiles.Count)"
+        Write-Host "  H files: $($hFiles.Count)"
+        
+        # Calculate lines of code
+        $totalLines = 0
+        $cFiles | ForEach-Object { $totalLines += (Get-Content $_.FullName | Measure-Object -Line).Lines }
+        $hFiles | ForEach-Object { $totalLines += (Get-Content $_.FullName | Measure-Object -Line).Lines }
+        
+        Write-Host "  Total Lines: $totalLines"
     
     - name: Check Documentation
       run: |
-        echo "Checking for required documentation files..."
-        if not exist "README.md" exit /b 1
-        if not exist "CHANGELOG.md" exit /b 1
-        echo "Documentation check passed"
+        Write-Host "=== Checking Required Documentation ==="
+        $requiredDocs = @("README.md", "CHANGELOG.md")
+        
+        foreach ($doc in $requiredDocs) {
+          if (Test-Path $doc) {
+            Write-Host "✓ $doc found"
+          } else {
+            Write-Error "✗ $doc NOT found"
+            exit 1
+          }
+        }
+        Write-Host "Documentation check passed"
     
     - name: Validate INF Files
       run: |
-        echo "Validating driver INF files..."
-        dir /s /b Ext4Fsd\*.inf
-        if not exist "Ext4Fsd\Ext2Fsd.inf" exit /b 1
-        echo "INF validation passed"
+        Write-Host "=== Validating Driver INF Files ==="
+        $infFiles = Get-ChildItem -Path Ext4Fsd -Filter "*.inf" -Recurse
+        
+        if ($infFiles.Count -eq 0) {
+          Write-Error "No .inf files found in Ext4Fsd directory"
+          exit 1
+        }
+        
+        $infFiles | ForEach-Object {
+          Write-Host "✓ Found: $($_.Name)"
+          if (-not (Select-String -Path $_.FullName -Pattern "DriverVer" -Quiet)) {
+            Write-Warning "  Warning: No DriverVer found in $($_.Name)"
+          }
+        }
+        Write-Host "INF validation passed"
 
   publish-artifacts:
     name: Publish Build Artifacts
@@ -413,20 +544,26 @@ jobs:
     
     steps:
     - name: Download All Artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
     
     - name: Create Summary
       run: |
-        echo "# Build Summary" > build-summary.md
-        echo "" >> build-summary.md
-        echo "**Build Date:** $(date)" >> build-summary.md
-        echo "**Commit:** ${{ github.sha }}" >> build-summary.md
-        echo "" >> build-summary.md
-        echo "## Artifacts" >> build-summary.md
-        ls -la | grep -E "^d" | awk '{print "- " $NF}' >> build-summary.md
+        {
+          echo "# Build Summary"
+          echo ""
+          echo "**Build Date:** $(date)"
+          echo "**Commit:** ${{ github.sha }}"
+          echo "**Branch:** ${{ github.ref }}"
+          echo ""
+          echo "## Artifacts"
+          ls -la | grep -E "^d" | awk '{print "- " $NF}' || echo "- (none)"
+        } > build-summary.md
+        
+        cat build-summary.md
     
     - name: Upload Summary
       uses: actions/upload-artifact@v4
       with:
-        name: build-summary
+        name: build-summary-report
         path: build-summary.md
+        retention-days: 30
