@@ -37,18 +37,35 @@ jobs:
           Write-Error "WDK installation failed or path not found at $wdkIncludeRoot"
           exit 1
         }
-        $latestInclude = Get-ChildItem $wdkIncludeRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
-        if (-not $latestInclude) {
+        $includeDirs = Get-ChildItem $wdkIncludeRoot -Directory | Sort-Object Name -Descending
+        if (-not $includeDirs) {
           Write-Error "Unable to locate versioned include directory under $wdkIncludeRoot"
           exit 1
         }
-        $umPath = Join-Path $latestInclude.FullName 'um'
-        $kmPath = Join-Path $latestInclude.FullName 'km'
-        if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
-        if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
+
+        $selectedInclude = $null
+        foreach ($dir in $includeDirs) {
+          $candidateUm = Join-Path $dir.FullName 'um'
+          $candidateKm = Join-Path $dir.FullName 'km'
+          $missing = @()
+          if (-not (Test-Path $candidateUm)) { $missing += 'UM' }
+          if (-not (Test-Path $candidateKm)) { $missing += 'KM' }
+          if ($missing.Count -eq 0) {
+            $selectedInclude = $dir
+            $umPath = $candidateUm
+            $kmPath = $candidateKm
+            break
+          }
+          Write-Host "Skipping version $($dir.Name) (missing $($missing -join ', '))"
+        }
+
+        if (-not $selectedInclude) {
+          Write-Error "Unable to locate include version with both UM and KM folders under $wdkIncludeRoot"
+          exit 1
+        }
         "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        Write-Host "✓ WDK ready at version $($latestInclude.Name)"
+        Write-Host "✓ WDK ready at version $($selectedInclude.Name)"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v1.1
