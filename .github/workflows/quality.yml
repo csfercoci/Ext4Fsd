@@ -47,13 +47,9 @@ jobs:
       run: |
         Write-Host "=== Verifying WDK Installation ==="
         
-        # Check multiple possible installation locations
-        $possibleRoots = @(
-          "${env:ProgramFiles(x86)}\Windows Kits\10",
-          "${env:ProgramFiles}\Windows Kits\10"
-        )
-        
         $wdkRoot = $null
+        $possibleRoots = @("$env:ProgramFiles\Windows Kits\10", "${env:ProgramFiles(x86)}\Windows Kits\10")
+        
         foreach ($root in $possibleRoots) {
           if (Test-Path "$root\Include") {
             $wdkRoot = $root
@@ -67,17 +63,17 @@ jobs:
           exit 1
         }
         
+        Write-Host "Available SDK versions:"
         $includeRoot = Join-Path $wdkRoot "Include"
-        Write-Host "`nAvailable SDK versions:"
         $versions = Get-ChildItem $includeRoot -Directory | Sort-Object Name -Descending
-        $versions | ForEach-Object { 
-          Write-Host "  - $($_.Name)"
-          $kmPath = Join-Path $_.FullName "km"
-          $umPath = Join-Path $_.FullName "um"
+        
+        foreach ($ver in $versions) {
+          Write-Host "  - $($ver.Name)"
+          $kmPath = Join-Path $ver.FullName "km"
+          $umPath = Join-Path $ver.FullName "um"
           Write-Host "    km: $(Test-Path $kmPath), um: $(Test-Path $umPath)"
         }
         
-        # Find a version with complete driver headers
         $selectedVersion = $null
         foreach ($ver in $versions) {
           $testKm = Join-Path $ver.FullName "km"
@@ -86,20 +82,17 @@ jobs:
           
           if ((Test-Path $testKm) -and (Test-Path $testUm) -and (Test-Path $testShared)) {
             $selectedVersion = $ver
-            Write-Host "`n✓ Selected SDK version: $($ver.Name)"
+            Write-Host "Selected SDK version: $($ver.Name)"
             
-            # Set environment variables
             $umPath = $testUm
             $kmPath = $testKm
-            $sharedPath = $testShared
             
             "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             
-            # Also set lib paths
-            $libRoot = Join-Path (Join-Path $wdkRoot "Lib") $ver.Name
+            $libRoot = Join-Path $wdkRoot "Lib\$($ver.Name)"
             if (Test-Path $libRoot) {
               "WindowsSdkLibPath=$libRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
@@ -109,23 +102,21 @@ jobs:
         }
         
         if (-not $selectedVersion) {
-          Write-Host "No SDK version found with complete driver development headers"
-          Write-Host "Trying alternative: Install specific WDK components..."
+          Write-Host "No complete SDK version found, trying Chocolatey fallback..."
           
-          # Fallback: try installing via Chocolatey as last resort
           choco install -y windows-sdk-10.0 --version=10.0.22621.0
           choco install -y windowsdriverkit10
           
-          # Re-check after installation
           Start-Sleep -Seconds 5
           $versions = Get-ChildItem $includeRoot -Directory | Sort-Object Name -Descending
+          
           foreach ($ver in $versions) {
             $testKm = Join-Path $ver.FullName "km"
             if (Test-Path $testKm) {
               $selectedVersion = $ver
               "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
               "KM_IncludePath=$testKm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              Write-Host "✓ Found version with km headers after Chocolatey install: $($ver.Name)"
+              Write-Host "Found version with km headers: $($ver.Name)"
               break
             }
           }
@@ -136,7 +127,7 @@ jobs:
           }
         }
         
-        Write-Host "`nWDK Configuration Complete"
+        Write-Host "WDK Configuration Complete"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v1.1
@@ -147,7 +138,6 @@ jobs:
           /p:Configuration=Release `
           /p:Platform=x64 `
           /p:WindowsTargetPlatformVersion=10.0 `
-
           /verbosity:minimal
     
     - name: Perform CodeQL Analysis
