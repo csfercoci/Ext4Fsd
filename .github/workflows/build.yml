@@ -113,6 +113,7 @@ jobs:
         msbuild Ext4Fsd.sln \
           /p:Configuration=${{ matrix.configuration }} \
           /p:Platform=${{ matrix.platform }} \
+          /p:WindowsTargetPlatformVersion=10.0 \
           /p:MaxCpuCount=4 \
           /verbosity:detailed \
           /fl \
@@ -237,6 +238,7 @@ Branch: ${{ github.ref }}
         msbuild Ext2Mgr/Ext2Mgr.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
+          /p:WindowsTargetPlatformVersion=10.0 `
           /p:MaxCpuCount=4 `
           /verbosity:detailed `
           /fl `
@@ -313,6 +315,7 @@ Branch: ${{ github.ref }}
         msbuild Ext2Srv/Ext2Srv.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
+          /p:WindowsTargetPlatformVersion=10.0 `
           /p:MaxCpuCount=4 `
           /verbosity:detailed `
           /fl `
