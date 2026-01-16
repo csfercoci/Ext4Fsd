@@ -94,7 +94,7 @@ jobs:
             $sharedPath = $testShared
             
             "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "WindowsSDKVersion=$($ver.Name)\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             
@@ -123,7 +123,7 @@ jobs:
             $testKm = Join-Path $ver.FullName "km"
             if (Test-Path $testKm) {
               $selectedVersion = $ver
-              "WindowsSDKVersion=$($ver.Name)\" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
               "KM_IncludePath=$testKm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
               Write-Host "✓ Found version with km headers after Chocolatey install: $($ver.Name)"
               break
