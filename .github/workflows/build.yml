@@ -75,15 +75,22 @@ jobs:
           Write-Error "✗ Platform ${{ matrix.platform }} NOT found in project - build may fail"
         }
     
+    - name: Retarget Windows SDK Version
+      run: |
+        Get-ChildItem -Path . -Recurse -Filter *.vcxproj | ForEach-Object {
+          (Get-Content $_.FullName) -replace '<WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>', '<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>' | Set-Content $_.FullName
+        }
+        Write-Host "✓ Retargeted Windows SDK version in all .vcxproj files"
+    
     - name: Build Solution
       run: |
         Write-Host "=== Starting MSBuild ==="
-        msbuild Ext4Fsd.sln `
-          /p:Configuration=${{ matrix.configuration }} `
-          /p:Platform=${{ matrix.platform }} `
-          /p:MaxCpuCount=4 `
-          /verbosity:detailed `
-          /fl `
+        msbuild Ext4Fsd.sln \
+          /p:Configuration=${{ matrix.configuration }} \
+          /p:Platform=${{ matrix.platform }} \
+          /p:MaxCpuCount=4 \
+          /verbosity:detailed \
+          /fl \
           /flp:LogFile=msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed
         
         if ($LASTEXITCODE -ne 0) {

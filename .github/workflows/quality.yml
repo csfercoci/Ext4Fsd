@@ -5,8 +5,6 @@ on:
     branches: [ master, develop ]
   pull_request:
     branches: [ master, develop ]
-  schedule:
-    - cron: '0 0 * * 0'  # Weekly scan
 
 jobs:
   codeql:
@@ -23,7 +21,7 @@ jobs:
       uses: actions/checkout@v4
     
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v2
+      uses: github/codeql-action/init@v3
       with:
         languages: ${{ matrix.language }}
     
@@ -38,7 +36,7 @@ jobs:
           /verbosity:minimal
     
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v2
+      uses: github/codeql-action/analyze@v3
 
   copyright-check:
     name: Check File Headers
