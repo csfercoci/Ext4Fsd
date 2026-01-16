@@ -39,6 +39,22 @@ jobs:
         } else {
           Write-Host "Windows SDK: NOT FOUND - May need installation"
         }
+
+    - name: Ensure Windows Driver Kit (WDK)
+      run: |
+        Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
+        $wdkInclude = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Include'
+        if (Test-Path $wdkInclude) {
+          Write-Host "WDK already present at $wdkInclude"
+        } else {
+          Write-Host "WDK not found. Installing via Chocolatey..."
+          choco install windowsdriverkit10 -y --no-progress
+        }
+        if (-not (Test-Path $wdkInclude)) {
+          Write-Error "WDK installation failed or path not found at $wdkInclude"
+          exit 1
+        }
+        Write-Host "✓ WDK ready"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
