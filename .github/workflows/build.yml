@@ -40,6 +40,14 @@ jobs:
           Write-Host "Windows SDK: NOT FOUND - May need installation"
         }
 
+    - name: Install Windows Driver Kit (WDK)
+      shell: powershell
+      run: |
+        Write-Host "=== Installing Windows SDK and WDK via Chocolatey ==="
+        choco install -y windows-sdk-10-version-2104-all
+        choco install -y windowsdriverkit10
+        Write-Host "Installation completed"
+
     - name: Ensure Windows Driver Kit (WDK)
       run: |
         Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
