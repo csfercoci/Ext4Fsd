@@ -144,9 +144,20 @@ jobs:
           exit 1
         }
 
-        $latestVersion = Get-ChildItem $includeRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        $candidateVersions = Get-ChildItem $includeRoot -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' }
+        $latestVersion = $null
+        foreach ($ver in ($candidateVersions | Sort-Object Name -Descending)) {
+          $testUm = Join-Path $ver.FullName "um"
+          $testShared = Join-Path $ver.FullName "shared"
+          $testUcrt = Join-Path $ver.FullName "ucrt"
+          if ((Test-Path $testUm) -and (Test-Path $testShared) -and (Test-Path $testUcrt)) {
+            $latestVersion = $ver
+            break
+          }
+        }
+
         if (-not $latestVersion) {
-          Write-Error "No SDK version found in $includeRoot"
+          Write-Error "No SDK version with um/shared/ucrt includes found in $includeRoot"
           exit 1
         }
 
