@@ -144,8 +144,17 @@ jobs:
       env:
         WindowsSdkDir: ${{ env.WindowsSdkDir }}
         WindowsSDKVersion: ${{ env.WindowsSDKVersion }}
+        KM_IncludePath: ${{ env.KM_IncludePath }}
+        UM_IncludePath: ${{ env.UM_IncludePath }}
       run: |
-        msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0 /verbosity:minimal
+        echo === Configuring include paths ===
+        echo KM_IncludePath=%KM_IncludePath%
+        echo UM_IncludePath=%UM_IncludePath%
+
+        set "INCLUDE=%KM_IncludePath%;%UM_IncludePath%;%INCLUDE%"
+
+        echo === Building with MSBuild ===
+        msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0 /p:AdditionalIncludeDirectories="%KM_IncludePath%;%UM_IncludePath%" /verbosity:minimal
     
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
