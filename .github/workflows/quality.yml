@@ -147,16 +147,18 @@ jobs:
         KM_IncludePath: ${{ env.KM_IncludePath }}
         UM_IncludePath: ${{ env.UM_IncludePath }}
         Shared_IncludePath: ${{ env.Shared_IncludePath }}
+        UCRT_IncludePath: ${{ env.UCRT_IncludePath }}
       run: |
         echo === Configuring include paths ===
         echo KM_IncludePath=%KM_IncludePath%
         echo UM_IncludePath=%UM_IncludePath%
         echo Shared_IncludePath=%Shared_IncludePath%
+        echo UCRT_IncludePath=%UCRT_IncludePath%
 
-        set "INCLUDE=%KM_IncludePath%;%UM_IncludePath%;%Shared_IncludePath%;%INCLUDE%"
+        set "INCLUDE=%KM_IncludePath%;%UM_IncludePath%;%Shared_IncludePath%;%UCRT_IncludePath%;%INCLUDE%"
 
         echo === Building with MSBuild ===
-        msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0 /p:AdditionalIncludeDirectories="%KM_IncludePath%;%UM_IncludePath%;%Shared_IncludePath%;%(AdditionalIncludeDirectories)" /verbosity:minimal
+        msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0 /p:AdditionalIncludeDirectories="%KM_IncludePath%;%UM_IncludePath%;%Shared_IncludePath%;%UCRT_IncludePath%;%(AdditionalIncludeDirectories)" /verbosity:minimal
     
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
