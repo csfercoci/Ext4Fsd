@@ -67,6 +67,11 @@ jobs:
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Add NuGet
       uses: nuget/setup-nuget@v2
@@ -108,17 +113,22 @@ jobs:
         Write-Host "✓ Retargeted Windows SDK version in all .vcxproj files"
     
     - name: Build Solution
+      shell: pwsh
       run: |
         Write-Host "=== Starting MSBuild ==="
-        msbuild Ext4Fsd.sln \
-          /p:Configuration=${{ matrix.configuration }} \
-          /p:Platform=${{ matrix.platform }} \
-          /p:WindowsTargetPlatformVersion=10.0 \
-          /p:MaxCpuCount=4 \
-          /verbosity:detailed \
-          /fl \
-          /flp:LogFile=msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed
-        
+        $msbuildArgs = @(
+          "Ext4Fsd.sln",
+          "/p:Configuration=${{ matrix.configuration }}",
+          "/p:Platform=${{ matrix.platform }}",
+          "/p:WindowsTargetPlatformVersion=10.0",
+          "/p:MaxCpuCount=4",
+          "/verbosity:detailed",
+          "/fl",
+          "/flp:LogFile=msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed"
+        )
+
+        msbuild @msbuildArgs
+
         if ($LASTEXITCODE -ne 0) {
           Write-Error "MSBuild failed for platform ${{ matrix.platform }} configuration ${{ matrix.configuration }}"
           exit 1
@@ -231,6 +241,11 @@ Branch: ${{ github.ref }}
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Build Ext2Mgr
       run: |
@@ -308,6 +323,11 @@ Branch: ${{ github.ref }}
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Build Ext2Srv
       run: |
@@ -356,6 +376,11 @@ Branch: ${{ github.ref }}
     
     - name: Setup Visual Studio Build Tools
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
     
     - name: Compile CRC Test
       run: |
