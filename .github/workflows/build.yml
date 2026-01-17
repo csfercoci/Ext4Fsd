@@ -40,13 +40,50 @@ jobs:
           Write-Host "Windows SDK: NOT FOUND - May need installation"
         }
 
-    - name: Install Windows Driver Kit (WDK)
+    - name: Install Windows Driver Kit (WDK) via Chocolatey
       shell: powershell
       run: |
-        Write-Host "=== Installing Windows SDK and WDK via Chocolatey ==="
-        choco install -y windows-sdk-10-version-2104-all
-        choco install -y windowsdriverkit10
-        Write-Host "Installation completed"
+        Write-Host "=== Installing WDK via Chocolatey ==="
+        choco install -y windows-sdk-10-version-2104-all --no-progress
+        choco install -y windowsdriverkit10 --no-progress
+
+        Write-Host "=== Locating WDK paths ==="
+        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        $includeRoot = Join-Path $wdkRoot "Include"
+
+        if (-not (Test-Path $includeRoot)) {
+          Write-Error "WDK include directory not found at $includeRoot"
+          exit 1
+        }
+
+        $latestVersion = Get-ChildItem $includeRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+
+        if (-not $latestVersion) {
+          Write-Error "No SDK version found in $includeRoot"
+          exit 1
+        }
+
+        $kmPath = Join-Path $latestVersion.FullName "km"
+        $umPath = Join-Path $latestVersion.FullName "um"
+        $sharedPath = Join-Path $latestVersion.FullName "shared"
+
+        Write-Host "Selected SDK version: $($latestVersion.Name)"
+        Write-Host "  KM path: $kmPath (exists: $(Test-Path $kmPath))"
+        Write-Host "  UM path: $umPath (exists: $(Test-Path $umPath))"
+        Write-Host "  Shared path: $sharedPath (exists: $(Test-Path $sharedPath))"
+
+        if (-not (Test-Path $kmPath)) {
+          Write-Error "Kernel-mode headers not found at $kmPath"
+          exit 1
+        }
+
+        "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "WindowsSDKVersion=$($latestVersion.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+        Write-Host "✓ WDK configuration complete"
 
     - name: Ensure Windows Driver Kit (WDK)
       run: |
