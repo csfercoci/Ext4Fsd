@@ -25,7 +25,17 @@ jobs:
       with:
         languages: ${{ matrix.language }}
 
+    - name: Cache Windows Kits
+      id: cache-wdk
+      uses: actions/cache@v4
+      with:
+        path: C:\Program Files (x86)\Windows Kits\10
+        key: ${{ runner.os }}-wdk10-v2
+        restore-keys: |
+          ${{ runner.os }}-wdk10-
+
     - name: Install Windows Driver Kit (WDK)
+      if: steps.cache-wdk.outputs.cache-hit != 'true'
       shell: powershell
       run: |
         Write-Host "=== Downloading and Installing Windows Driver Kit (WDK) ==="
