@@ -97,14 +97,14 @@ jobs:
             $umPath = $testUm
             $kmPath = $testKm
             
-            "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-            "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-            "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-            "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+            Add-Content -Path $env:GITHUB_ENV -Value "WindowsSdkDir=$wdkRoot"
+            Add-Content -Path $env:GITHUB_ENV -Value "WindowsSDKVersion=$($ver.Name)"
+            Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+            Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
             
             $libRoot = Join-Path $wdkRoot "Lib\$($ver.Name)"
             if (Test-Path $libRoot) {
-              "WindowsSdkLibPath=$libRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+              Add-Content -Path $env:GITHUB_ENV -Value "WindowsSdkLibPath=$libRoot"
             }
             
             break
@@ -124,8 +124,8 @@ jobs:
             $testKm = Join-Path $ver.FullName "km"
             if (Test-Path $testKm) {
               $selectedVersion = $ver
-              "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-              "KM_IncludePath=$testKm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+              Add-Content -Path $env:GITHUB_ENV -Value "WindowsSDKVersion=$($ver.Name)"
+              Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$testKm"
               Write-Host "Found version with km headers: $($ver.Name)"
               break
             }
@@ -186,10 +186,10 @@ jobs:
         if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
         if (-not (Test-Path $ucrtPath)) { Write-Error "UCRT include path missing at $ucrtPath"; exit 1 }
 
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v1.1

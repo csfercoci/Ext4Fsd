@@ -102,12 +102,12 @@ jobs:
           exit 1
         }
 
-        "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "WindowsSDKVersion=$($latestVersion.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        Add-Content -Path $env:GITHUB_ENV -Value "WindowsSdkDir=$wdkRoot"
+        Add-Content -Path $env:GITHUB_ENV -Value "WindowsSDKVersion=$($latestVersion.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
 
         Write-Host "✓ WDK configuration complete"
 
@@ -323,10 +323,10 @@ Branch: ${{ github.ref }}
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
         if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
@@ -430,10 +430,10 @@ Branch: ${{ github.ref }}
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
         if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
-        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
