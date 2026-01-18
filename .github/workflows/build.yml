@@ -79,12 +79,12 @@ jobs:
           exit 1
         }
 
-        "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "WindowsSDKVersion=$($latestVersion.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "WindowsSDKVersion=$($latestVersion.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
 
         Write-Host "✓ WDK configuration complete"
 
@@ -107,10 +107,15 @@ jobs:
         }
         $umPath = Join-Path $latestInclude.FullName 'um'
         $kmPath = Join-Path $latestInclude.FullName 'km'
+        $sharedPath = Join-Path $latestInclude.FullName 'shared'
+        $ucrtPath = Join-Path $latestInclude.FullName 'ucrt'
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
+        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
@@ -167,6 +172,25 @@ jobs:
         Write-Host "KM_IncludePath: $env:KM_IncludePath"
         Write-Host "UM_IncludePath: $env:UM_IncludePath"
         Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        Write-Host "UCRT_IncludePath: $env:UCRT_IncludePath"
+        
+        # Validate paths exist
+        if (-not $env:KM_IncludePath -or -not (Test-Path $env:KM_IncludePath)) {
+          Write-Error "KM_IncludePath is not set or path does not exist: $env:KM_IncludePath"
+          exit 1
+        }
+        if (-not $env:Shared_IncludePath -or -not (Test-Path $env:Shared_IncludePath)) {
+          Write-Error "Shared_IncludePath is not set or path does not exist: $env:Shared_IncludePath"
+          exit 1
+        }
+        
+        # Check for mountmgr.h specifically
+        $mountmgrPath = Join-Path $env:KM_IncludePath "mountmgr.h"
+        if (Test-Path $mountmgrPath) {
+          Write-Host "✓ Found mountmgr.h at: $mountmgrPath"
+        } else {
+          Write-Warning "mountmgr.h not found at: $mountmgrPath"
+        }
         
         $msbuildArgs = @(
           "Ext4Fsd.sln",
@@ -271,6 +295,7 @@ Branch: ${{ github.ref }}
       uses: actions/checkout@v4
 
     - name: Ensure Windows Driver Kit (WDK)
+      shell: pwsh
       run: |
         Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
         $wdkIncludeRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Include'
@@ -289,10 +314,15 @@ Branch: ${{ github.ref }}
         }
         $umPath = Join-Path $latestInclude.FullName 'um'
         $kmPath = Join-Path $latestInclude.FullName 'km'
+        $sharedPath = Join-Path $latestInclude.FullName 'shared'
+        $ucrtPath = Join-Path $latestInclude.FullName 'ucrt'
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
+        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
@@ -304,12 +334,20 @@ Branch: ${{ github.ref }}
         arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Build Ext2Mgr
+      shell: pwsh
       run: |
         Write-Host "Building Ext2Mgr for ${{ matrix.platform }} - ${{ matrix.configuration }}"
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        
         msbuild Ext2Mgr/Ext2Mgr.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:WindowsTargetPlatformVersion=10.0 `
+          /p:KM_IncludePath="$env:KM_IncludePath" `
+          /p:UM_IncludePath="$env:UM_IncludePath" `
+          /p:Shared_IncludePath="$env:Shared_IncludePath" `
+          /p:UCRT_IncludePath="$env:UCRT_IncludePath" `
           /p:MaxCpuCount=4 `
           /verbosity:detailed `
           /fl `
@@ -353,6 +391,7 @@ Branch: ${{ github.ref }}
       uses: actions/checkout@v4
 
     - name: Ensure Windows Driver Kit (WDK)
+      shell: pwsh
       run: |
         Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
         $wdkIncludeRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Include'
@@ -371,10 +410,15 @@ Branch: ${{ github.ref }}
         }
         $umPath = Join-Path $latestInclude.FullName 'um'
         $kmPath = Join-Path $latestInclude.FullName 'km'
+        $sharedPath = Join-Path $latestInclude.FullName 'shared'
+        $ucrtPath = Join-Path $latestInclude.FullName 'ucrt'
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
+        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "Shared_IncludePath=$sharedPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
+        "UCRT_IncludePath=$ucrtPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8NoBOM -Append
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
@@ -386,12 +430,20 @@ Branch: ${{ github.ref }}
         arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Build Ext2Srv
+      shell: pwsh
       run: |
         Write-Host "Building Ext2Srv for ${{ matrix.platform }} - ${{ matrix.configuration }}"
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        
         msbuild Ext2Srv/Ext2Srv.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:WindowsTargetPlatformVersion=10.0 `
+          /p:KM_IncludePath="$env:KM_IncludePath" `
+          /p:UM_IncludePath="$env:UM_IncludePath" `
+          /p:Shared_IncludePath="$env:Shared_IncludePath" `
+          /p:UCRT_IncludePath="$env:UCRT_IncludePath" `
           /p:MaxCpuCount=4 `
           /verbosity:detailed `
           /fl `
