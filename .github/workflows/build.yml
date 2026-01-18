@@ -164,11 +164,19 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "=== Starting MSBuild ==="
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "UM_IncludePath: $env:UM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        
         $msbuildArgs = @(
           "Ext4Fsd.sln",
           "/p:Configuration=${{ matrix.configuration }}",
           "/p:Platform=${{ matrix.platform }}",
           "/p:WindowsTargetPlatformVersion=10.0",
+          "/p:KM_IncludePath=$env:KM_IncludePath",
+          "/p:UM_IncludePath=$env:UM_IncludePath",
+          "/p:Shared_IncludePath=$env:Shared_IncludePath",
+          "/p:UCRT_IncludePath=$env:UCRT_IncludePath",
           "/p:MaxCpuCount=4",
           "/verbosity:detailed",
           "/fl",

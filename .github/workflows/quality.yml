@@ -192,25 +192,28 @@ jobs:
         arch: x64
     
     - name: Build with MSBuild
-      shell: cmd
-      env:
-        WindowsSdkDir: ${{ env.WindowsSdkDir }}
-        WindowsSDKVersion: ${{ env.WindowsSDKVersion }}
-        KM_IncludePath: ${{ env.KM_IncludePath }}
-        UM_IncludePath: ${{ env.UM_IncludePath }}
-        Shared_IncludePath: ${{ env.Shared_IncludePath }}
-        UCRT_IncludePath: ${{ env.UCRT_IncludePath }}
+      shell: pwsh
       run: |
-        echo === Configuring include paths ===
-        echo KM_IncludePath=%KM_IncludePath%
-        echo UM_IncludePath=%UM_IncludePath%
-        echo Shared_IncludePath=%Shared_IncludePath%
-        echo UCRT_IncludePath=%UCRT_IncludePath%
+        Write-Host "=== Configuring include paths ==="
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "UM_IncludePath: $env:UM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        Write-Host "UCRT_IncludePath: $env:UCRT_IncludePath"
 
-        set "INCLUDE=%KM_IncludePath%;%UM_IncludePath%;%Shared_IncludePath%;%UCRT_IncludePath%;%INCLUDE%"
+        Write-Host "=== Building with MSBuild ==="
+        $msbuildArgs = @(
+          "Ext4Fsd.sln",
+          "/p:Configuration=Release",
+          "/p:Platform=x64",
+          "/p:WindowsTargetPlatformVersion=10.0",
+          "/p:KM_IncludePath=$env:KM_IncludePath",
+          "/p:UM_IncludePath=$env:UM_IncludePath",
+          "/p:Shared_IncludePath=$env:Shared_IncludePath",
+          "/p:UCRT_IncludePath=$env:UCRT_IncludePath",
+          "/verbosity:minimal"
+        )
 
-        echo === Building with MSBuild ===
-        msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0 /p:AdditionalIncludeDirectories="%KM_IncludePath%;%UM_IncludePath%;%Shared_IncludePath%;%UCRT_IncludePath%;%(AdditionalIncludeDirectories)" /verbosity:minimal
+        msbuild @msbuildArgs
     
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
