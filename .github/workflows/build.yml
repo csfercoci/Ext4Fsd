@@ -40,33 +40,84 @@ jobs:
           Write-Host "Windows SDK: NOT FOUND - May need installation"
         }
 
-    - name: Ensure Windows Driver Kit (WDK)
+    - name: Cache Chocolatey packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          C:\ProgramData\chocolatey\lib
+          C:\ProgramData\chocolatey\cache
+        key: ${{ runner.os }}-choco-wdk-v2
+        restore-keys: |
+          ${{ runner.os }}-choco-wdk-
+
+    - name: Cache Windows Kits
+      id: cache-wdk
+      uses: actions/cache@v4
+      with:
+        path: C:\Program Files (x86)\Windows Kits\10
+        key: ${{ runner.os }}-wdk10-v2
+        restore-keys: |
+          ${{ runner.os }}-wdk10-
+
+    - name: Install Windows Driver Kit (WDK) via Chocolatey
+      if: steps.cache-wdk.outputs.cache-hit != 'true'
+      shell: powershell
       run: |
-        Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
-        $wdkIncludeRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Include'
-        if (-not (Test-Path $wdkIncludeRoot)) {
-          Write-Host "WDK include path missing. Installing via Chocolatey..."
-          choco install windowsdriverkit10 -y --no-progress
-        }
-        if (-not (Test-Path $wdkIncludeRoot)) {
-          Write-Error "WDK installation failed or path not found at $wdkIncludeRoot"
+        Write-Host "=== Installing WDK via Chocolatey ==="
+        choco install -y windows-sdk-10-version-2104-all --no-progress
+        choco install -y windowsdriverkit10 --no-progress
+
+    - name: Configure WDK Paths
+      shell: powershell
+      run: |
+        Write-Host "=== Locating WDK paths ==="
+        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        $includeRoot = Join-Path $wdkRoot "Include"
+
+        if (-not (Test-Path $includeRoot)) {
+          Write-Error "WDK include directory not found at $includeRoot"
           exit 1
         }
-        $latestInclude = Get-ChildItem $wdkIncludeRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
-        if (-not $latestInclude) {
-          Write-Error "Unable to locate versioned include directory under $wdkIncludeRoot"
+
+        $latestVersion = Get-ChildItem $includeRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+
+        if (-not $latestVersion) {
+          Write-Error "No SDK version found in $includeRoot"
           exit 1
         }
-        $umPath = Join-Path $latestInclude.FullName 'um'
-        $kmPath = Join-Path $latestInclude.FullName 'km'
-        if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
-        if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        Write-Host "✓ WDK ready at version $($latestInclude.Name)"
-    
+
+        $kmPath = Join-Path $latestVersion.FullName "km"
+        $umPath = Join-Path $latestVersion.FullName "um"
+        $sharedPath = Join-Path $latestVersion.FullName "shared"
+        $ucrtPath = Join-Path $latestVersion.FullName "ucrt"
+
+        Write-Host "Selected SDK version: $($latestVersion.Name)"
+        Write-Host "  KM path: $kmPath (exists: $(Test-Path $kmPath))"
+        Write-Host "  UM path: $umPath (exists: $(Test-Path $umPath))"
+        Write-Host "  Shared path: $sharedPath (exists: $(Test-Path $sharedPath))"
+        Write-Host "  UCRT path: $ucrtPath (exists: $(Test-Path $ucrtPath))"
+
+        if (-not (Test-Path $kmPath)) {
+          Write-Error "Kernel-mode headers not found at $kmPath"
+          exit 1
+        }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "WindowsSdkDir=$wdkRoot"
+        Add-Content -Path $env:GITHUB_ENV -Value "WindowsSDKVersion=$($latestVersion.Name)"
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
+
+        Write-Host "✓ WDK configuration complete"
+
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Add NuGet
       uses: nuget/setup-nuget@v2
@@ -108,17 +159,49 @@ jobs:
         Write-Host "✓ Retargeted Windows SDK version in all .vcxproj files"
     
     - name: Build Solution
+      shell: pwsh
       run: |
         Write-Host "=== Starting MSBuild ==="
-        msbuild Ext4Fsd.sln \
-          /p:Configuration=${{ matrix.configuration }} \
-          /p:Platform=${{ matrix.platform }} \
-          /p:WindowsTargetPlatformVersion=10.0 \
-          /p:MaxCpuCount=4 \
-          /verbosity:detailed \
-          /fl \
-          /flp:LogFile=msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "UM_IncludePath: $env:UM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        Write-Host "UCRT_IncludePath: $env:UCRT_IncludePath"
         
+        # Validate paths exist
+        if (-not $env:KM_IncludePath -or -not (Test-Path $env:KM_IncludePath)) {
+          Write-Error "KM_IncludePath is not set or path does not exist: $env:KM_IncludePath"
+          exit 1
+        }
+        if (-not $env:Shared_IncludePath -or -not (Test-Path $env:Shared_IncludePath)) {
+          Write-Error "Shared_IncludePath is not set or path does not exist: $env:Shared_IncludePath"
+          exit 1
+        }
+        
+        # Check for mountmgr.h specifically
+        $mountmgrPath = Join-Path $env:KM_IncludePath "mountmgr.h"
+        if (Test-Path $mountmgrPath) {
+          Write-Host "✓ Found mountmgr.h at: $mountmgrPath"
+        } else {
+          Write-Warning "mountmgr.h not found at: $mountmgrPath"
+        }
+        
+        $msbuildArgs = @(
+          "Ext4Fsd.sln",
+          "/p:Configuration=${{ matrix.configuration }}",
+          "/p:Platform=${{ matrix.platform }}",
+          "/p:WindowsTargetPlatformVersion=10.0",
+          "/p:KM_IncludePath=$env:KM_IncludePath",
+          "/p:UM_IncludePath=$env:UM_IncludePath",
+          "/p:Shared_IncludePath=$env:Shared_IncludePath",
+          "/p:UCRT_IncludePath=$env:UCRT_IncludePath",
+          "/p:MaxCpuCount=4",
+          "/verbosity:detailed",
+          "/fl",
+          "/flp:LogFile=msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log;Verbosity=detailed"
+        )
+
+        msbuild @msbuildArgs
+
         if ($LASTEXITCODE -ne 0) {
           Write-Error "MSBuild failed for platform ${{ matrix.platform }} configuration ${{ matrix.configuration }}"
           exit 1
@@ -204,14 +287,26 @@ Branch: ${{ github.ref }}
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Ensure Windows Driver Kit (WDK)
+    - name: Cache Windows Kits
+      id: cache-wdk
+      uses: actions/cache@v4
+      with:
+        path: C:\Program Files (x86)\Windows Kits\10
+        key: ${{ runner.os }}-wdk10-v2
+        restore-keys: |
+          ${{ runner.os }}-wdk10-
+
+    - name: Install WDK if not cached
+      if: steps.cache-wdk.outputs.cache-hit != 'true'
+      shell: pwsh
       run: |
-        Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
+        Write-Host "=== Installing WDK via Chocolatey ==="
+        choco install windowsdriverkit10 -y --no-progress
+
+    - name: Configure WDK Paths
+      shell: pwsh
+      run: |
         $wdkIncludeRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Include'
-        if (-not (Test-Path $wdkIncludeRoot)) {
-          Write-Host "WDK include path missing. Installing via Chocolatey..."
-          choco install windowsdriverkit10 -y --no-progress
-        }
         if (-not (Test-Path $wdkIncludeRoot)) {
           Write-Error "WDK installation failed or path not found at $wdkIncludeRoot"
           exit 1
@@ -223,22 +318,40 @@ Branch: ${{ github.ref }}
         }
         $umPath = Join-Path $latestInclude.FullName 'um'
         $kmPath = Join-Path $latestInclude.FullName 'km'
+        $sharedPath = Join-Path $latestInclude.FullName 'shared'
+        $ucrtPath = Join-Path $latestInclude.FullName 'ucrt'
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Build Ext2Mgr
+      shell: pwsh
       run: |
         Write-Host "Building Ext2Mgr for ${{ matrix.platform }} - ${{ matrix.configuration }}"
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        
         msbuild Ext2Mgr/Ext2Mgr.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:WindowsTargetPlatformVersion=10.0 `
+          /p:KM_IncludePath="$env:KM_IncludePath" `
+          /p:UM_IncludePath="$env:UM_IncludePath" `
+          /p:Shared_IncludePath="$env:Shared_IncludePath" `
+          /p:UCRT_IncludePath="$env:UCRT_IncludePath" `
           /p:MaxCpuCount=4 `
           /verbosity:detailed `
           /fl `
@@ -281,14 +394,26 @@ Branch: ${{ github.ref }}
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Ensure Windows Driver Kit (WDK)
+    - name: Cache Windows Kits
+      id: cache-wdk
+      uses: actions/cache@v4
+      with:
+        path: C:\Program Files (x86)\Windows Kits\10
+        key: ${{ runner.os }}-wdk10-v2
+        restore-keys: |
+          ${{ runner.os }}-wdk10-
+
+    - name: Install WDK if not cached
+      if: steps.cache-wdk.outputs.cache-hit != 'true'
+      shell: pwsh
       run: |
-        Write-Host "=== Ensuring Windows Driver Kit (WDK) is installed ==="
+        Write-Host "=== Installing WDK via Chocolatey ==="
+        choco install windowsdriverkit10 -y --no-progress
+
+    - name: Configure WDK Paths
+      shell: pwsh
+      run: |
         $wdkIncludeRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Include'
-        if (-not (Test-Path $wdkIncludeRoot)) {
-          Write-Host "WDK include path missing. Installing via Chocolatey..."
-          choco install windowsdriverkit10 -y --no-progress
-        }
         if (-not (Test-Path $wdkIncludeRoot)) {
           Write-Error "WDK installation failed or path not found at $wdkIncludeRoot"
           exit 1
@@ -300,22 +425,40 @@ Branch: ${{ github.ref }}
         }
         $umPath = Join-Path $latestInclude.FullName 'um'
         $kmPath = Join-Path $latestInclude.FullName 'km'
+        $sharedPath = Join-Path $latestInclude.FullName 'shared'
+        $ucrtPath = Join-Path $latestInclude.FullName 'ucrt'
         if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
         if (-not (Test-Path $kmPath)) { Write-Error "KM include path missing at $kmPath"; exit 1 }
-        "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
         Write-Host "✓ WDK ready at version $($latestInclude.Name)"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ fromJSON('{"Win32":"x86","x64":"x64","ARM":"arm","ARM64":"arm64"}')[matrix.platform] }}
     
     - name: Build Ext2Srv
+      shell: pwsh
       run: |
         Write-Host "Building Ext2Srv for ${{ matrix.platform }} - ${{ matrix.configuration }}"
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        
         msbuild Ext2Srv/Ext2Srv.vcxproj `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /p:WindowsTargetPlatformVersion=10.0 `
+          /p:KM_IncludePath="$env:KM_IncludePath" `
+          /p:UM_IncludePath="$env:UM_IncludePath" `
+          /p:Shared_IncludePath="$env:Shared_IncludePath" `
+          /p:UCRT_IncludePath="$env:UCRT_IncludePath" `
           /p:MaxCpuCount=4 `
           /verbosity:detailed `
           /fl `
@@ -356,6 +499,11 @@ Branch: ${{ github.ref }}
     
     - name: Setup Visual Studio Build Tools
       uses: microsoft/setup-msbuild@v2
+
+    - name: Setup Visual Studio Developer Environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
     
     - name: Compile CRC Test
       run: |

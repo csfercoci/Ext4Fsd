@@ -25,7 +25,17 @@ jobs:
       with:
         languages: ${{ matrix.language }}
 
+    - name: Cache Windows Kits
+      id: cache-wdk
+      uses: actions/cache@v4
+      with:
+        path: C:\Program Files (x86)\Windows Kits\10
+        key: ${{ runner.os }}-wdk10-v2
+        restore-keys: |
+          ${{ runner.os }}-wdk10-
+
     - name: Install Windows Driver Kit (WDK)
+      if: steps.cache-wdk.outputs.cache-hit != 'true'
       shell: powershell
       run: |
         Write-Host "=== Downloading and Installing Windows Driver Kit (WDK) ==="
@@ -87,14 +97,14 @@ jobs:
             $umPath = $testUm
             $kmPath = $testKm
             
-            "WindowsSdkDir=$wdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "UM_IncludePath=$umPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "KM_IncludePath=$kmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Add-Content -Path $env:GITHUB_ENV -Value "WindowsSdkDir=$wdkRoot"
+            Add-Content -Path $env:GITHUB_ENV -Value "WindowsSDKVersion=$($ver.Name)"
+            Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+            Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
             
             $libRoot = Join-Path $wdkRoot "Lib\$($ver.Name)"
             if (Test-Path $libRoot) {
-              "WindowsSdkLibPath=$libRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              Add-Content -Path $env:GITHUB_ENV -Value "WindowsSdkLibPath=$libRoot"
             }
             
             break
@@ -114,8 +124,8 @@ jobs:
             $testKm = Join-Path $ver.FullName "km"
             if (Test-Path $testKm) {
               $selectedVersion = $ver
-              "WindowsSDKVersion=$($ver.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              "KM_IncludePath=$testKm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              Add-Content -Path $env:GITHUB_ENV -Value "WindowsSDKVersion=$($ver.Name)"
+              Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$testKm"
               Write-Host "Found version with km headers: $($ver.Name)"
               break
             }
@@ -128,6 +138,58 @@ jobs:
         }
         
         Write-Host "WDK Configuration Complete"
+
+    - name: Locate Windows SDK Include Paths
+      shell: powershell
+      run: |
+        Write-Host "=== Locating Windows SDK include paths ==="
+        $wdkRoot = $env:WindowsSdkDir
+        if (-not $wdkRoot) {
+          $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        }
+
+        $includeRoot = Join-Path $wdkRoot "Include"
+        if (-not (Test-Path $includeRoot)) {
+          Write-Error "Windows SDK include directory not found at $includeRoot"
+          exit 1
+        }
+
+        $candidateVersions = Get-ChildItem $includeRoot -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' }
+        $latestVersion = $null
+        foreach ($ver in ($candidateVersions | Sort-Object Name -Descending)) {
+          $testUm = Join-Path $ver.FullName "um"
+          $testShared = Join-Path $ver.FullName "shared"
+          $testUcrt = Join-Path $ver.FullName "ucrt"
+          if ((Test-Path $testUm) -and (Test-Path $testShared) -and (Test-Path $testUcrt)) {
+            $latestVersion = $ver
+            break
+          }
+        }
+
+        if (-not $latestVersion) {
+          Write-Error "No SDK version with um/shared/ucrt includes found in $includeRoot"
+          exit 1
+        }
+
+        $kmPath = Join-Path $latestVersion.FullName "km"
+        $umPath = Join-Path $latestVersion.FullName "um"
+        $sharedPath = Join-Path $latestVersion.FullName "shared"
+        $ucrtPath = Join-Path $latestVersion.FullName "ucrt"
+
+        Write-Host "Selected SDK version: $($latestVersion.Name)"
+        Write-Host "  KM path: $kmPath (exists: $(Test-Path $kmPath))"
+        Write-Host "  UM path: $umPath (exists: $(Test-Path $umPath))"
+        Write-Host "  Shared path: $sharedPath (exists: $(Test-Path $sharedPath))"
+        Write-Host "  UCRT path: $ucrtPath (exists: $(Test-Path $ucrtPath))"
+
+        if (-not (Test-Path $umPath)) { Write-Error "UM include path missing at $umPath"; exit 1 }
+        if (-not (Test-Path $sharedPath)) { Write-Error "Shared include path missing at $sharedPath"; exit 1 }
+        if (-not (Test-Path $ucrtPath)) { Write-Error "UCRT include path missing at $ucrtPath"; exit 1 }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "KM_IncludePath=$kmPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UM_IncludePath=$umPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "Shared_IncludePath=$sharedPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "UCRT_IncludePath=$ucrtPath"
     
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v1.1
@@ -140,12 +202,28 @@ jobs:
         arch: x64
     
     - name: Build with MSBuild
-      shell: cmd
-      env:
-        WindowsSdkDir: ${{ env.WindowsSdkDir }}
-        WindowsSDKVersion: ${{ env.WindowsSDKVersion }}
+      shell: pwsh
       run: |
-        msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.22621.0 /verbosity:minimal
+        Write-Host "=== Configuring include paths ==="
+        Write-Host "KM_IncludePath: $env:KM_IncludePath"
+        Write-Host "UM_IncludePath: $env:UM_IncludePath"
+        Write-Host "Shared_IncludePath: $env:Shared_IncludePath"
+        Write-Host "UCRT_IncludePath: $env:UCRT_IncludePath"
+
+        Write-Host "=== Building with MSBuild ==="
+        $msbuildArgs = @(
+          "Ext4Fsd.sln",
+          "/p:Configuration=Release",
+          "/p:Platform=x64",
+          "/p:WindowsTargetPlatformVersion=10.0",
+          "/p:KM_IncludePath=$env:KM_IncludePath",
+          "/p:UM_IncludePath=$env:UM_IncludePath",
+          "/p:Shared_IncludePath=$env:Shared_IncludePath",
+          "/p:UCRT_IncludePath=$env:UCRT_IncludePath",
+          "/verbosity:minimal"
+        )
+
+        msbuild @msbuildArgs
     
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
