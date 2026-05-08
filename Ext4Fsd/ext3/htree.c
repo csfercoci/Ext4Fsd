@@ -1486,7 +1486,8 @@ struct buffer_head *
     hash = hinfo.hash;
     do {
         block = dx_get_block(frame->at);
-        if (!(bh = ext3_bread (icb, dir, block, err)))
+        if (!(bh = ext3_bread_cached(icb, dir, block, err,
+                               (__u32)dir->i_ino ^ block)))
             goto errout;
         de = (struct ext3_dir_entry_2 *) bh->b_data;
         top = (struct ext3_dir_entry_2 *) ((char *) de + sb->s_blocksize -
@@ -1643,7 +1644,8 @@ int ext3_dx_add_entry(struct ext2_icb *icb, struct dentry *dentry,
     entries = frame->entries;
     at = frame->at;
 
-    if (!(bh = ext3_bread(icb, dir, dx_get_block(frame->at), &err)))
+    if (!(bh = ext3_bread_cached(icb, dir, dx_get_block(frame->at), &err,
+                               (__u32)dir->i_ino ^ dx_get_block(frame->at))))
         goto cleanup;
 
     err = add_dirent_to_buf(icb, dentry, inode, NULL, bh);
