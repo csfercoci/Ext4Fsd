@@ -92,22 +92,8 @@ static void htree_cache_add(__u32 key, struct buffer_head *bh)
 static struct buffer_head *ext3_bread_cached(struct ext2_icb *icb, struct inode *inode,
                                            unsigned long block, int *err, __u32 cache_key)
 {
-    struct buffer_head *bh;
-
-    bh = htree_cache_lookup(cache_key);
-    if (bh) {
-        if (buffer_uptodate(bh)) {
-            return bh;
-        }
-        brelse(bh);
-    }
-
-    bh = ext3_bread(icb, inode, block, err);
-    if (bh) {
-        htree_cache_add(cache_key, bh);
-    }
-
-    return bh;
+    UNREFERENCED_PARAMETER(cache_key);
+    return ext3_bread(icb, inode, block, err);
 }
 
 /* F, G and H are basic MD4 functions: selection, majority, parity */
