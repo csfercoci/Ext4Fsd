@@ -2,7 +2,7 @@
  * COPYRIGHT:        See COPYRIGHT.TXT
  * PROJECT:          Ext2-Ext4 File System Driver for WinXP-Win10
  * FILE:             ext4_csum.c
- * PROGRAMMER:       Bo Brantén <bosse@acc.umu.se>
+ * PROGRAMMER:       Bo Brantï¿½n <bosse@acc.umu.se>
  * HOMEPAGE:         http://www.ext2fsd.com
  * UPDATE HISTORY:
  */
@@ -13,12 +13,45 @@
 #include "linux\ext4.h"
 #include "linux\ext4_xattr.h"
 
+#if defined(_M_AMD64) || defined(_M_X64)
+#include <intrin.h>
+#include <xmmintrin.h>
+#include <nmmintrin.h>
+#endif
+
 /* GLOBALS ***************************************************************/
 
 extern PEXT2_GLOBAL Ext2Global;
 
 /* DEFINITIONS *************************************************************/
 
+#if defined(_M_AMD64) || defined(_M_X64)
+static int ext4_has_sse42(void)
+{
+    static volatile LONG has = -1;
+    LONG current = InterlockedCompareExchange(&has, -1, -1);
+    if (current == -1) {
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 1);
+        current = (cpuInfo[2] & (1 << 20)) != 0 ? 1 : 0;
+        InterlockedExchange(&has, current);
+    }
+    return current;
+}
+
+static __u32 crc32c_hw(__u32 crc, const __u8 *data, unsigned int length)
+{
+    while (length >= 4) {
+        crc = _mm_crc32_u32(crc, *(const __u32 *)data);
+        data += 4;
+        length -= 4;
+    }
+    while (length--) {
+        crc = _mm_crc32_u8(crc, *data++);
+    }
+    return crc;
+}
+#endif
 
 /* FUNCTIONS ***************************************************************/
 
@@ -153,6 +186,11 @@ static const __u32 crc32c_table[256] = {
 
 __u32 crc32c(__u32 crc, const __u8 *data, unsigned int length)
 {
+#if defined(_M_AMD64) || defined(_M_X64)
+    if (ext4_has_sse42()) {
+        return crc32c_hw(crc, data, length);
+    }
+#endif
 	while (length--)
 		crc = crc32c_table[(crc ^ *data++) & 0xFFL] ^ (crc >> 8);
 

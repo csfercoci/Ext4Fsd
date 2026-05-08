@@ -1,0 +1,55 @@
+name: Build Ext4Fsd
+
+on:
+  push:
+    branches: [master, fix-wdk-build-v2]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Install WDK
+      shell: pwsh
+      run: |
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2306896"
+        $wdkExe = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe
+        Start-Process -FilePath $wdkExe -ArgumentList "/q", "/norestart", "/features", "+" -Wait -NoNewWindow
+
+    - name: Build driver (Release|x64)
+      run: msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /t:Build
+
+    - name: Install NSIS
+      uses: joncloud/makensis-action@v4
+
+    - name: Build installer
+      run: makensis Setup\ext2fsd.nsi
+
+    - name: Upload driver
+      uses: actions/upload-artifact@v4
+      with:
+        name: Ext2Fsd.sys
+        path: Ext4Fsd\Release\x64\Ext2Fsd.sys
+
+    - name: Upload user tools
+      uses: actions/upload-artifact@v4
+      with:
+        name: Ext2Tools
+        path: |
+          Ext2Srv\Release\x64\Ext2Srv.exe
+          Ext2Mgr\Release\x64\Ext2Mgr.exe
+
+    - name: Upload installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: Ext2Fsd-setup
+        path: Setup\Ext2Fsd-setup.exe
