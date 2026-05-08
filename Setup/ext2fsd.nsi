@@ -108,6 +108,13 @@ else:
 endif:
 
 File "..\ext4fsd\${DRIVERNAME}.inf"
+File "Ext2Fsd.cer"
+
+; install the test certificate to Trusted Publishers
+nsExec::ExecToLog '"$WINDIR\sysnative\certutil.exe" -addstore -f TrustedPublisher "$INSTDIR\Ext2Fsd.cer"'
+
+; enable test signing if not already enabled (requires reboot)
+nsExec::ExecToLog '"$WINDIR\sysnative\bcdedit.exe" /set testsigning on'
 
 SetOutPath $INSTDIR\Documents
 File "..\ext4fsd\COPYRIGHT.txt"
@@ -178,6 +185,7 @@ IfFileExists $WINDIR\SysWOW64\*.* 0 else
     ExecWait '"$WINDIR\sysnative\rundll32.exe" setupapi.dll,InstallHinfSection DefaultUninstall 132 $INSTDIR\${DRIVERNAME}.inf'
     Delete $INSTDIR\${VCDLL_X64A}.dll"
     Delete $INSTDIR\${VCDLL_X64B}.dll"
+    Delete $INSTDIR\Ext2Fsd.cer"
     Goto endif
 else:
     ; 32-bit
