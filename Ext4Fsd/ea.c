@@ -47,6 +47,9 @@ static int Ext2IterateAllEa(struct ext4_xattr_ref *xattr_ref, struct ext4_xattr_
 {
 	struct EaIterator *pEaIterator = xattr_ref->iter_arg;
 	ULONG EaEntrySize = 4 + 1 + 1 + 2 + item->name_len + 1 + item->data_size;
+	if (item->name_len > 255 || item->data_size > 65535) {
+		return -1;
+	}
 	ASSERT(pEaIterator);
 	if (!is_last && !pEaIterator->ReturnSingleEntry)
 		EaEntrySize = ALIGN_UP(EaEntrySize, ULONG);

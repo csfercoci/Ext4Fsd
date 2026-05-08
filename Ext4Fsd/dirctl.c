@@ -98,6 +98,9 @@ Ext2ProcessEntry(
 
     *EntrySize = 0;
     NameLength = pName->Length;
+    if (NameLength > MAX_PATH) {
+        return STATUS_NAME_TOO_LONG;
+    }
     ASSERT((UsedLength & 7) == 0);
 
     InfoLength = Ext2GetInfoLength(FileInformationClass);

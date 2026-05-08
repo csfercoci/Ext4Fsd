@@ -27,6 +27,89 @@
 #define swap(type, x, y) do { type z = x; x = y; y = z; } while (0)
 #endif
 
+#define HTREE_CACHE_SIZE 16
+
+struct htree_cache_entry {
+    __u32 hash;
+    struct buffer_head *bh;
+};
+
+static struct htree_cache_entry g_htree_cache[HTREE_CACHE_SIZE];
+static int g_htree_cache_index;
+static KSPIN_LOCK g_htree_cache_lock;
+static BOOLEAN g_htree_cache_initialized;
+
+void htree_cache_init(void)
+{
+    if (!g_htree_cache_initialized) {
+        RtlZeroMemory(g_htree_cache, sizeof(g_htree_cache));
+        g_htree_cache_index = 0;
+        KeInitializeSpinLock(&g_htree_cache_lock);
+        g_htree_cache_initialized = TRUE;
+    }
+}
+
+static struct buffer_head *htree_cache_lookup(__u32 key)
+{
+    int i;
+    KLOCK_QUEUE_HANDLE LockHandle;
+
+    KeAcquireInStackQueuedSpinLock(&g_htree_cache_lock, &LockHandle);
+    for (i = 0; i < HTREE_CACHE_SIZE; i++) {
+        if (g_htree_cache[i].hash == key && g_htree_cache[i].bh) {
+            get_bh(g_htree_cache[i].bh);
+            KeReleaseInStackQueuedSpinLock(&LockHandle);
+            dxtrace(printk("htree cache hit for key %x\n", key));
+            return g_htree_cache[i].bh;
+        }
+    }
+    KeReleaseInStackQueuedSpinLock(&LockHandle);
+    return NULL;
+}
+
+static void htree_cache_add(__u32 key, struct buffer_head *bh)
+{
+    KLOCK_QUEUE_HANDLE LockHandle;
+
+    if (!bh) return;
+
+    KeAcquireInStackQueuedSpinLock(&g_htree_cache_lock, &LockHandle);
+
+    if (g_htree_cache[g_htree_cache_index].bh) {
+        brelse(g_htree_cache[g_htree_cache_index].bh);
+    }
+
+    get_bh(bh);
+    g_htree_cache[g_htree_cache_index].hash = key;
+    g_htree_cache[g_htree_cache_index].bh = bh;
+    g_htree_cache_index = (g_htree_cache_index + 1) % HTREE_CACHE_SIZE;
+
+    KeReleaseInStackQueuedSpinLock(&LockHandle);
+
+    dxtrace(printk("htree cache add key %x\n", key));
+}
+
+static struct buffer_head *ext3_bread_cached(struct ext2_icb *icb, struct inode *inode,
+                                           unsigned long block, int *err, __u32 cache_key)
+{
+    struct buffer_head *bh;
+
+    bh = htree_cache_lookup(cache_key);
+    if (bh) {
+        if (buffer_uptodate(bh)) {
+            return bh;
+        }
+        brelse(bh);
+    }
+
+    bh = ext3_bread(icb, inode, block, err);
+    if (bh) {
+        htree_cache_add(cache_key, bh);
+    }
+
+    return bh;
+}
+
 /* F, G and H are basic MD4 functions: selection, majority, parity */
 #define F(x, y, z) ((z) ^ ((x) & ((y) ^ (z))))
 #define G(x, y, z) (((x) & (y)) + (((x) ^ (y)) & (z)))
@@ -956,7 +1039,7 @@ static struct dx_frame *
     frame->bh = NULL;
     if (dentry)
         dir = dentry->d_parent->d_inode;
-    if (!(bh = ext3_bread (icb, dir, 0, err)))
+    if (!(bh = ext3_bread_cached(icb, dir, 0, err, (__u32)dir->i_ino)))
         goto fail;
     root = (struct dx_root *) bh->b_data;
     if (root->info.hash_version != DX_HASH_TEA &&
@@ -1048,7 +1131,8 @@ static struct dx_frame *
         frame->entries = entries;
         frame->at = at;
         if (!indirect--) return frame;
-        if (!(bh = ext3_bread(icb, dir, dx_get_block(at), err)))
+        if (!(bh = ext3_bread_cached(icb, dir, dx_get_block(at), err,
+                                   (__u32)dir->i_ino ^ dx_get_block(at))))
             goto fail2;
         at = entries = ((struct dx_node *) bh->b_data)->entries;
         if (dx_get_limit(entries) != dx_node_limit (dir)) {
@@ -1146,7 +1230,8 @@ int ext3_htree_next_block(struct ext2_icb *icb, struct inode *dir,
      * block so no check is necessary
      */
     while (num_frames--) {
-        if (!(bh = ext3_bread(icb, dir, dx_get_block(p->at), &err)))
+        if (!(bh = ext3_bread_cached(icb, dir, dx_get_block(p->at), &err,
+                                   (__u32)dir->i_ino ^ dx_get_block(p->at))))
             return err; /* Failure */
         p++;
         brelse (p->bh);

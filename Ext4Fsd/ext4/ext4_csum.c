@@ -203,6 +203,16 @@ __u32 ext4_chksum(struct ext4_sb_info *sbi, __u32 crc,
     return crc32c(crc, buffer, length);
 }
 
+__u32 ext4_chksum_batch(struct ext4_sb_info *sbi, __u32 crc,
+                        const void **buffers, unsigned int *lengths, int count)
+{
+    int i;
+    for (i = 0; i < count; i++) {
+        crc = crc32c(crc, buffers[i], lengths[i]);
+    }
+    return crc;
+}
+
 /*
  * Metadata checksum functions for the superblock.
  */

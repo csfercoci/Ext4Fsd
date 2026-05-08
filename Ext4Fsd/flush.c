@@ -128,7 +128,7 @@ Ext2FlushFiles(
             ListEntry = ListEntry->Flink ) {
 
         Fcb = CONTAINING_RECORD(ListEntry, EXT2_FCB, Next);
-        ExAcquireResourceExclusiveLite(
+        ExAcquireResourceSharedLite(
             &Fcb->MainResource, TRUE);
         Ext2FlushFile(IrpContext, Fcb, NULL);
         ExReleaseResourceLite(&Fcb->MainResource);

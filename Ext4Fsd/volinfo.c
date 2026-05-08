@@ -130,9 +130,9 @@ Ext2QueryVolumeInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
             FsSizeInfo = (PFILE_FS_SIZE_INFORMATION) Buffer;
             FsSizeInfo->TotalAllocationUnits.QuadPart =
-                ext3_blocks_count(SUPER_BLOCK);
+                (ULONGLONG)ext3_blocks_count(SUPER_BLOCK);
             FsSizeInfo->AvailableAllocationUnits.QuadPart =
-                ext3_free_blocks_count(SUPER_BLOCK);
+                (ULONGLONG)ext3_free_blocks_count(SUPER_BLOCK);
             FsSizeInfo->SectorsPerAllocationUnit =
                 Vcb->BlockSize / Vcb->DiskGeometry.BytesPerSector;
             FsSizeInfo->BytesPerSector =
