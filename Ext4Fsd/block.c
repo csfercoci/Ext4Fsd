@@ -183,8 +183,12 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
 
     ASSERT(FALSE == pContext->Wait);
 
-    if (Irp != pContext->MasterIrp && !NT_SUCCESS(Irp->IoStatus.Status)) {
-        pContext->MasterIrp->IoStatus = Irp->IoStatus;
+    if (Irp != pContext->MasterIrp) {
+        if (!NT_SUCCESS(Irp->IoStatus.Status)) {
+            pContext->MasterIrp->IoStatus = Irp->IoStatus;
+        }
+        IoFreeMdl(Irp->MdlAddress);
+        IoFreeIrp(Irp);
     }
 
     if (InterlockedDecrement(&pContext->Blocks) == 0) {

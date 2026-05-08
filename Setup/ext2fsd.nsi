@@ -1,7 +1,7 @@
 ; ext2fsd.nsi
 ;
 ; This is a NSIS script to create an install program for the Ext2Fsd project
-; developed by Bo Brantén <bosse@accum.se> in 2020 to help beta testing.
+; developed by Bo Brantï¿½n <bosse@accum.se> in 2020 to help beta testing.
 ;
 ; To build an installation program follow these steps:
 ; 1. Install NSIS (Nullsoft Scriptable Install System)
@@ -18,22 +18,22 @@ Name "Ext2,Ext3,Ext4 filesystem driver"
 !define DRIVERNAME "Ext2Fsd"
 Icon "..\Ext2Mgr\res\Ext2Mgr.ico"
 Caption "${PROJECTNAME} 0.71"
-DirText "This is a release of the ${PROJECTNAME} project from Bo Brantén to test the new ext4 features metadata checksums and 64-bit block numbers. You may choose the install directory:"
+DirText "This is a release of the ${PROJECTNAME} project from Bo Brantï¿½n to test the new ext4 features metadata checksums and 64-bit block numbers. You may choose the install directory:"
 InstallDir "$PROGRAMFILES\${PROJECTNAME}"
 OutFile "${PROJECTNAME}-setup.exe"
 
 ; the paths to the binaries when compiled with Visual Studio to support Windows 10.
 ; (the driver files are automatically signed or testsigned by Visual Studio)
-!define MGRPATH_X86 "..\Ext2Mgr\Release\x86"
+!define MGRPATH_X86 "${MGRPATH_X64}"
 !define MGRPATH_X64 "..\Ext2Mgr\Release\x64"
-!define SRVPATH_X86 "..\Ext2Srv\Release\x86"
+!define SRVPATH_X86 "${SRVPATH_X64}"
 !define SRVPATH_X64 "..\Ext2Srv\Release\x64"
-!define SYSPATH_X86 "..\drivers\Release\x86"
-!define SYSPATH_X64 "..\drivers\Release\x64"
-!define MSVPATH_X86 "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.42.34433\x86\Microsoft.VC143.CRT"
-!define MSVPATH_X64 "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.42.34433\x64\Microsoft.VC143.CRT"
-!define MFCPATH_X86 "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.42.34433\x86\Microsoft.VC143.MFC"
-!define MFCPATH_X64 "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.42.34433\x64\Microsoft.VC143.MFC"
+!define SYSPATH_X86 "${SYSPATH_X64}"
+!define SYSPATH_X64 "..\Ext4Fsd\Release\x64"
+!define MSVPATH_X86 "${MSVPATH_X64}"
+!define MSVPATH_X64 "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
+!define MFCPATH_X86 "${MFCPATH_X64}"
+!define MFCPATH_X64 "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.MFC"
 !define VCDLL_X86 "vcruntime140"
 !define VCDLL_X64A "vcruntime140"
 !define VCDLL_X64B "vcruntime140_1"
