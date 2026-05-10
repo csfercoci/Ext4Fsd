@@ -1863,19 +1863,24 @@ static int ext4_remove_blocks(void *icb, handle_t *handle, struct inode *inode,
 		struct ext4_extent *ex,
 		unsigned long from, unsigned long to)
 {
-	struct buffer_head *bh;
-	int i;
+	unsigned long ee_block = le32_to_cpu(ex->ee_block);
+	unsigned long ee_len = ext4_ext_get_actual_len(ex);
+	ext4_fsblk_t ee_pblock = ext4_ext_pblock(ex);
 
-	if (from >= le32_to_cpu(ex->ee_block)
-			&& to == le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex) - 1) {
+	if (from >= ee_block && to == ee_block + ee_len - 1) {
 		/* tail removal */
-		unsigned long num, start;
-		num = le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex) - from;
-		start = ext4_ext_pblock(ex) + ext4_ext_get_actual_len(ex) - num;
+		unsigned long num = ee_block + ee_len - from;
+		unsigned long start = ee_pblock + ee_len - num;
 		ext4_free_blocks(icb, handle, inode, NULL, start, num, 0);
-	} else if (from == le32_to_cpu(ex->ee_block)
-			&& to <= le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex) - 1) {
+	} else if (from == ee_block && to < ee_block + ee_len - 1) {
+		/* head removal: free blocks [from..to], keep [to+1..end] */
+		unsigned long num = to - from + 1;
+		ext4_free_blocks(icb, handle, inode, NULL, ee_pblock, num, 0);
 	} else {
+		/* middle removal: free blocks [from..to] */
+		unsigned long num = to - from + 1;
+		ext4_fsblk_t start = ee_pblock + (from - ee_block);
+		ext4_free_blocks(icb, handle, inode, NULL, start, num, 0);
 	}
 	return 0;
 }

@@ -418,7 +418,10 @@ Ext2WriteVolume (IN PEXT2_IRP_CONTEXT IrpContext)
                     __leave;
                 }
 
-                CcCopyWrite(Vcb->Volume, (PLARGE_INTEGER)(&ByteOffset), Length, TRUE, Buffer);
+                if (!CcCopyWrite(Vcb->Volume, (PLARGE_INTEGER)(&ByteOffset), Length, TRUE, Buffer)) {
+                    Status = STATUS_UNEXPECTED_IO_ERROR;
+                    __leave;
+                }
 
                 Status = Irp->IoStatus.Status;
                 Ext2AddVcbExtent(Vcb, ByteOffset.QuadPart, (LONGLONG)Length);
@@ -1046,7 +1049,6 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                 }
 
                 Fcb->Header.FileSize.QuadPart = Fcb->Inode->i_size = ByteOffset.QuadPart + Length;
-                Ext2SaveInode(IrpContext, Vcb, Fcb->Inode);
 
                 if (CcIsFileCached(FileObject)) {
                     CcSetFileSizes(FileObject, (PCC_FILE_SIZES)(&(Fcb->Header.AllocationSize)));
@@ -1118,7 +1120,14 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                     }
                 }
 
-                CcCopyWrite(FileObject, &ByteOffset, Length, TRUE, Buffer);
+                if (!CcCopyWrite(FileObject, &ByteOffset, Length, Ext2CanIWait(), Buffer)) {
+                    if (Ext2CanIWait() ||
+                        !CcCopyWrite(FileObject, &ByteOffset, Length, TRUE, Buffer)) {
+
+                        Status = STATUS_INSUFFICIENT_RESOURCES;
+                        __leave;
+                    }
+                }
 
                 if (ByteOffset.QuadPart + Length > Fcb->Header.ValidDataLength.QuadPart ) {
 
@@ -1138,6 +1147,12 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
 
             if (NT_SUCCESS(Status)) {
                 Irp->IoStatus.Information = Length;
+
+                if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
+                    Ext2SaveInode(IrpContext, Vcb, Fcb->Inode);
+                    ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
+                }
+
                 if (IsFlagOn(Vcb->Flags, VCB_FLOPPY_DISK)) {
                     DEBUG(DL_FLP, ("Ext2WriteFile is starting FlushingDpc...\n"));
                     Ext2StartFloppyFlushDpc(Vcb, Fcb, FileObject);
@@ -1172,7 +1187,6 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
             }
 
             Irp->IoStatus.Status = STATUS_SUCCESS;
-            Irp->IoStatus.Information = ReturnedLength;
 
             Status = Ext2WriteInode(
                          IrpContext,
@@ -1186,6 +1200,12 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                      );
 
             Irp = IrpContext->Irp;
+
+            if (NT_SUCCESS(Status)) {
+                Irp->IoStatus.Information = Length;
+            } else {
+                Irp->IoStatus.Information = 0;
+            }
 
             if (NT_SUCCESS(Status) && !RecursiveWriteThrough && !IsLazyWriter(Fcb)) {
 

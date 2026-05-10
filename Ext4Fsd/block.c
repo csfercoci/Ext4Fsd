@@ -462,7 +462,8 @@ Ext2ReadSync(
     IN PEXT2_VCB        Vcb,
     IN ULONGLONG        Offset,
     IN ULONG            Length,
-    OUT PVOID           Buffer
+    OUT PVOID           Buffer,
+    IN BOOLEAN          bVerify
 )
 {
     PKEVENT         Event = NULL;
@@ -502,6 +503,11 @@ Ext2ReadSync(
         if (!Irp) {
             Status = STATUS_INSUFFICIENT_RESOURCES;
             __leave;
+        }
+
+        if (bVerify) {
+            SetFlag( IoGetNextIrpStackLocation(Irp)->Flags,
+                     SL_OVERRIDE_VERIFY_VOLUME );
         }
 
         Status = IoCallDriver(Vcb->TargetDeviceObject, Irp);
@@ -566,7 +572,8 @@ Ext2ReadDisk(
     Status = Ext2ReadSync(  Vcb,
                             Lba,
                             Length,
-                            Buf );
+                            Buf,
+                            bVerify );
 
     if (!NT_SUCCESS(Status)) {
         DEBUG(DL_ERR, ("Ext2ReadDisk: disk i/o error: %xh.\n", Status));

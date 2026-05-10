@@ -6,8 +6,6 @@ enum {
     true	= 1
 };
 
-#ifndef offsetof
-#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
-#endif
+#include <stddef.h>
 
 #endif /* _LINUX_STDDEF_H */

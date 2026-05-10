@@ -80,7 +80,8 @@ errorout:
 
 int kmem_cache_destroy(kmem_cache_t * kc)
 {
-    ASSERT(kc != NULL);
+    if (kc == NULL)
+        return 0;
 
     ExDeleteNPagedLookasideList(&(kc->la));
     kfree(kc);
@@ -824,6 +825,9 @@ void __brelse(struct buffer_head *bh)
 
 void __bforget(struct buffer_head *bh)
 {
+    if (buffer_dirty(bh)) {
+        ll_rw_block(WRITE, 1, &bh);
+    }
     clear_buffer_dirty(bh);
     __brelse(bh);
 }
@@ -1006,7 +1010,7 @@ int _strnicmp(const char* str1, const char* str2, size_t count)
 	return (int)c1 - (int)c2;
 }
 
-#if !defined(_M_ARM64) && !defined(_M_ARM)
+#if 0
 
 int strncmp(const char* str1, const char* str2, size_t count)
 {

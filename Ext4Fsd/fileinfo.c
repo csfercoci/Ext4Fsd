@@ -840,13 +840,15 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
             if (NewSize.QuadPart > OldSize.QuadPart) {
 
-                Fcb->Header.AllocationSize = NewSize;
                 Status = Ext2ExpandFile(
                                  IrpContext,
                                  Vcb,
                                  Mcb,
-                                 &(Fcb->Header.AllocationSize)
+                                 &NewSize
                              );
+                if (NT_SUCCESS(Status)) {
+                    Fcb->Header.AllocationSize = NewSize;
+                }
                 NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
                 SetLongFlag(Fcb->Flags, FCB_ALLOC_IN_SETINFO);
 
@@ -915,8 +917,9 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                 NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
             }
 
-
-            Ext2SaveInode( IrpContext, Vcb, &Mcb->Inode);
+            if (NT_SUCCESS(Status)) {
+                Ext2SaveInode( IrpContext, Vcb, &Mcb->Inode);
+            }
 
             DEBUG(DL_IO, ("Ext2SetInformation: FileEndOfFileInformation %wZ EndofFile=%I64xh "
                           "AllocatieonSize=%I64xh FileSize=%I64xh VDL=%I64xh i_size=%I64xh status = %xh\n",

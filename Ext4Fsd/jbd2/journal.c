@@ -2677,6 +2677,7 @@ static int __init jbd2_journal_init_handle_cache(void)
 	if (jbd2_inode_cache == NULL) {
 		printk(KERN_EMERG "JBD2: failed to create inode cache\n");
 		kmem_cache_destroy(jbd2_handle_cache);
+		jbd2_handle_cache = NULL;
 		return -ENOMEM;
 	}
 	return 0;

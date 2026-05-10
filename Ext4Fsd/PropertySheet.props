@@ -2,7 +2,9 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ImportGroup Label="PropertySheets" />
   <PropertyGroup Label="UserMacros" />
-  <PropertyGroup />
+  <PropertyGroup>
+    <WDKBuildFolder>$(WindowsTargetPlatformVersion)</WDKBuildFolder>
+  </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <DisableSpecificWarnings>4996;4064;4627;4627;4366;%(DisableSpecificWarnings)</DisableSpecificWarnings>

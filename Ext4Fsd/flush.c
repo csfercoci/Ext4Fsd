@@ -206,13 +206,10 @@ Ext2Flush (IN PEXT2_IRP_CONTEXT IrpContext)
 
             Ext2VerifyVcb(IrpContext, Vcb);
             Status = Ext2FlushFiles(IrpContext, (PEXT2_VCB)(FcbOrVcb), FALSE);
+
             if (NT_SUCCESS(Status)) {
-                __leave;
+                Status = Ext2FlushVolume(IrpContext, (PEXT2_VCB)(FcbOrVcb), FALSE);
             }
-
-            /* TO INVESTIGATE: Ext2FlushFiles will always return STATUS_SUCCESS so Ext2FlushVolume will never be called? */
-
-            Status = Ext2FlushVolume(IrpContext, (PEXT2_VCB)(FcbOrVcb), FALSE);
 
             if (NT_SUCCESS(Status) && IsFlagOn(Vcb->Volume->Flags, FO_FILE_MODIFIED)) {
                 ClearFlag(Vcb->Volume->Flags, FO_FILE_MODIFIED);

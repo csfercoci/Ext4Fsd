@@ -1201,7 +1201,8 @@ Ext2ReadSync(
     IN PEXT2_VCB        Vcb,
     IN ULONGLONG        Offset,
     IN ULONG            Length,
-    OUT PVOID           Buffer );
+    OUT PVOID           Buffer,
+    IN BOOLEAN          bVerify );
 
 NTSTATUS
 Ext2ReadDisk(

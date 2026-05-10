@@ -43,6 +43,8 @@
     <Platform Condition="'$(Platform)' == ''">Win32</Platform>
     <RootNamespace>Ext4Fsd</RootNamespace>
     <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WDKBuildFolder>$(WindowsTargetPlatformVersion)</WDKBuildFolder>
+    <TargetPlatformVersion_CO>10.0.19041.0</TargetPlatformVersion_CO>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -153,63 +155,63 @@
   <PropertyGroup />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\x86\</OutDir>
-    <IntDir>$(ConfigurationName)\x86\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\x86\</OutDir>
+    <IntDir>$(Configuration)\x86\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\x86\</OutDir>
-    <IntDir>$(ConfigurationName)\x86\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\x86\</OutDir>
+    <IntDir>$(Configuration)\x86\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\x64\</OutDir>
-    <IntDir>$(ConfigurationName)\x64\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\x64\</OutDir>
+    <IntDir>$(Configuration)\x64\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\x64\</OutDir>
-    <IntDir>$(ConfigurationName)\x64\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\x64\</OutDir>
+    <IntDir>$(Configuration)\x64\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\arm\</OutDir>
-    <IntDir>$(ConfigurationName)\arm\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\arm\</OutDir>
+    <IntDir>$(Configuration)\arm\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\arm\</OutDir>
-    <IntDir>$(ConfigurationName)\arm\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\arm\</OutDir>
+    <IntDir>$(Configuration)\arm\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\arm64\</OutDir>
-    <IntDir>$(ConfigurationName)\arm64\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\arm64\</OutDir>
+    <IntDir>$(Configuration)\arm64\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
-    <OutDir>$(SolutionDir)Ext4Fsd\$(ConfigurationName)\arm64\</OutDir>
-    <IntDir>$(ConfigurationName)\arm64\</IntDir>
+    <OutDir>$(SolutionDir)Ext4Fsd\$(Configuration)\arm64\</OutDir>
+    <IntDir>$(Configuration)\arm64\</IntDir>
     <TargetName>Ext2Fsd</TargetName>
     <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -223,7 +225,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -237,7 +239,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -248,7 +250,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -259,7 +261,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -270,7 +272,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -281,7 +283,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -289,7 +291,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>.\include;.\include\linux;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\include;.\include\asm;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WarningLevel>Level3</WarningLevel>
       <PreprocessorDefinitions>__KERNEL__;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <DisableSpecificWarnings>4995;%(DisableSpecificWarnings)</DisableSpecificWarnings>

@@ -364,6 +364,16 @@ Ext2FlushVcb(IN PEXT2_VCB Vcb)
         o = Vcb->PartitionInformation.PartitionLength;
         Ext2FlushRange(Vcb, s, o);
 
+        /* flush dirty buffer_heads before releasing locks */
+        node = rb_first(&Vcb->bd.bd_bh_root);
+        while (node) {
+            bh = container_of(node, struct buffer_head, b_rb_node);
+            node = rb_next(node);
+            if (buffer_dirty(bh)) {
+                ll_rw_block(WRITE, 1, &bh);
+            }
+        }
+
     } __finally {
 
         ExReleaseResourceLite(&Vcb->bd.bd_bh_lock);
@@ -593,9 +603,12 @@ Ext2SaveInode ( IN PEXT2_IRP_CONTEXT IrpContext,
         goto errorout;
     }
 
+    ExAcquireResourceExclusiveLite(&Vcb->sbi.s_gd_lock, TRUE);
+
     rc = Ext2LoadBuffer(NULL, Vcb, offset, EXT4_INODE_SIZE(Inode->i_sb), ext4i);
     if (!rc) {
         DEBUG(DL_ERR, ( "Ext2SaveInode: failed reading inode %u.\n", Inode->i_ino));
+        ExReleaseResourceLite(&Vcb->sbi.s_gd_lock);
         Ext2FreePool(ext4i, EXT2_INODE_MAGIC);
         goto errorout;
     }
@@ -605,6 +618,8 @@ Ext2SaveInode ( IN PEXT2_IRP_CONTEXT IrpContext,
     ext4_inode_csum_set(Inode, ext4i, &unused);
 
     rc = Ext2SaveBuffer(IrpContext, Vcb, offset, EXT4_INODE_SIZE(Inode->i_sb), ext4i);
+
+    ExReleaseResourceLite(&Vcb->sbi.s_gd_lock);
 
     if (rc && IsFlagOn(Vcb->Flags, VCB_FLOPPY_DISK)) {
         Ext2StartFloppyFlushDpc(Vcb, NULL, NULL);

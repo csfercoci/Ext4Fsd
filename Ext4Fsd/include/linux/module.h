@@ -25,9 +25,7 @@
 
 /* STRUCTS ******************************************************/
 
-#ifndef offsetof
-# define offsetof(type, member) ((ULONG_PTR)&(((type *)0)->member))
-#endif
+#include <stddef.h>
 
 #ifndef container_of
 #define container_of(ptr, type, member)                  \
@@ -1115,7 +1113,7 @@ Ext2FreePool(
 
 void *kzalloc(int size, int flags);
 #define kmalloc(size, gfp) Ext2AllocatePool(NonPagedPool, size, 'JBDM')
-#define kfree(p) Ext2FreePool(p, 'JBDM')
+#define kfree(p) do { if (p) Ext2FreePool(p, 'JBDM'); } while(0)
 
 
 /* memory slab */
