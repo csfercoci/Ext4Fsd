@@ -409,9 +409,11 @@ Ext2ReadWriteBlocks(
             Status = KeWaitForSingleObject( &(pContext->Event),
                                    Executive, KernelMode, FALSE, &Timeout );
             if (Status == STATUS_TIMEOUT) {
-                /* Device likely removed — unblock and report error */
+                /* Keep pContext alive until late completions stop using it. */
                 MasterIrp->IoStatus.Status = STATUS_IO_TIMEOUT;
                 MasterIrp->IoStatus.Information = 0;
+                KeWaitForSingleObject( &(pContext->Event),
+                                       Executive, KernelMode, FALSE, NULL );
             }
             KeClearEvent( &(pContext->Event) );
         } else {

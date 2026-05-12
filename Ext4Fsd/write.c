@@ -1148,11 +1148,6 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
             if (NT_SUCCESS(Status)) {
                 Irp->IoStatus.Information = Length;
 
-                if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
-                    Ext2SaveInode(IrpContext, Vcb, Fcb->Inode);
-                    ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
-                }
-
                 if (IsFlagOn(Vcb->Flags, VCB_FLOPPY_DISK)) {
                     DEBUG(DL_FLP, ("Ext2WriteFile is starting FlushingDpc...\n"));
                     Ext2StartFloppyFlushDpc(Vcb, Fcb, FileObject);
@@ -1231,6 +1226,11 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                                    Fcb->Header.AllocationSize.QuadPart, ByteOffset.QuadPart, Length));
                 }
             }
+        }
+
+        if (NT_SUCCESS(Status) && IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
+            Ext2SaveInode(IrpContext, Vcb, Fcb->Inode);
+            ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
         }
 
         if (FileSizesChanged) {
