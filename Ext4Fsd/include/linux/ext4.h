@@ -1135,6 +1135,9 @@ struct ext4_inode_info {
 
 	/* Precomputed uuid+inum+igen checksum for seeding inode checksums */
 	__u32 i_csum_seed;
+
+	tid_t	i_sync_tid;
+	tid_t	i_datasync_tid;
 };
 
 /*
@@ -1447,6 +1450,11 @@ struct ext4_sb_info {
     __u32 s_hash_seed[4];
     int s_def_hash_version;
     __le32	s_csum_seed;	/* crc32c(uuid) if csum_seed set */
+
+    journal_t	        *s_journal;
+    void                *s_journal_mcb;
+    unsigned long		s_mount_opt;
+    unsigned long		s_mount_opt2;
 };
 
 static inline struct ext4_sb_info *EXT4_SB(struct super_block *sb)

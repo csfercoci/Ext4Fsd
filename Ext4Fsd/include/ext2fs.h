@@ -523,12 +523,12 @@ typedef struct _EXT2_GLOBAL {
     EXT2_REAPER                 bhReaper;
 
     /* Look Aside table of IRP_CONTEXT, FCB, MCB, CCB */
-    NPAGED_LOOKASIDE_LIST       Ext2IrpContextLookasideList;
-    NPAGED_LOOKASIDE_LIST       Ext2FcbLookasideList;
-    NPAGED_LOOKASIDE_LIST       Ext2CcbLookasideList;
-    NPAGED_LOOKASIDE_LIST       Ext2McbLookasideList;
-    NPAGED_LOOKASIDE_LIST       Ext2ExtLookasideList;
-    NPAGED_LOOKASIDE_LIST       Ext2DentryLookasideList;
+    LOOKASIDE_LIST_EX           Ext2IrpContextLookasideList;
+    LOOKASIDE_LIST_EX           Ext2FcbLookasideList;
+    LOOKASIDE_LIST_EX           Ext2CcbLookasideList;
+    LOOKASIDE_LIST_EX           Ext2McbLookasideList;
+    LOOKASIDE_LIST_EX           Ext2ExtLookasideList;
+    LOOKASIDE_LIST_EX           Ext2DentryLookasideList;
     USHORT                      MaxDepth;
 
     /* User specified global codepage name */
@@ -713,7 +713,7 @@ typedef struct _EXT2_VCB {
     ULONG                       InodeSize;
 
     // Inode lookaside list
-    NPAGED_LOOKASIDE_LIST       InodeLookasideList;
+    LOOKASIDE_LIST_EX           InodeLookasideList;
 
     // Flags for the volume
     ULONG                       Flags;
@@ -1049,6 +1049,12 @@ typedef struct ext2_icb {
 
     // The exception code when an exception is in progress
     NTSTATUS            ExceptionCode;
+
+    // Active JBD2 transaction handle for this IRP (NULL if none).
+    // Set by Ext2JournalStart, cleared by Ext2JournalStop.
+    // When non-NULL, metadata dirties go through journal instead of
+    // direct mark_buffer_dirty.
+    void                *Handle;
 
 } EXT2_IRP_CONTEXT, *PEXT2_IRP_CONTEXT;
 
@@ -1556,8 +1562,14 @@ Ext2OplockComplete (
     IN PIRP Irp
 );
 
-VOID
+NTSTATUS
 Ext2LockIrp (
+    IN PVOID Context,
+    IN PIRP Irp
+);
+
+VOID
+Ext2LockIrpCallback (
     IN PVOID Context,
     IN PIRP Irp
 );
@@ -1742,6 +1754,62 @@ Ext2LoadSuper(
     IN PEXT2_VCB      Vcb,
     IN BOOLEAN        bVerify,
     OUT PEXT2_SUPER_BLOCK * Sb
+);
+
+
+/*
+ * Journal helpers (ext3/recover.c). Start opens a JBD2 transaction
+ * on IrpContext->Handle if a journal is present. Stop commits and
+ * clears the handle. Both are safe no-ops when no journal exists.
+ *
+ * NestedStart returns TRUE if a new transaction was opened by this call
+ * (so the caller must Stop it). FALSE means a transaction was already
+ * active on the IrpContext (caller must NOT Stop).
+ */
+NTSTATUS
+Ext2JournalStart(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN ULONG                Blocks
+);
+
+NTSTATUS
+Ext2JournalStop(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb
+);
+
+BOOLEAN
+Ext2JournalNestedStart(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN ULONG                Blocks
+);
+
+VOID
+Ext2JournalRevokeBlock(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN ULONGLONG            BlockNr
+);
+
+NTSTATUS
+Ext2OrphanAdd(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN struct inode *       Inode
+);
+
+NTSTATUS
+Ext2OrphanDel(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN struct inode *       Inode
+);
+
+NTSTATUS
+Ext2ProcessOrphanList(
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb
 );
 
 

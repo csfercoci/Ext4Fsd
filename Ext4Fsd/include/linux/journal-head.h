@@ -87,6 +87,12 @@ struct journal_head {
      * [j_list_lock]
      */
     struct journal_head *b_cpnext, *b_cpprev;
+
+    /*
+     * Triggers
+     */
+    struct jbd2_buffer_trigger_type *b_triggers;
+    struct jbd2_buffer_trigger_type *b_frozen_triggers;
 };
 
 #endif		/* JOURNAL_HEAD_H_INCLUDED */

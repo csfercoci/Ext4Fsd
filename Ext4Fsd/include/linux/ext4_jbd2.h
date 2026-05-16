@@ -57,6 +57,10 @@ static inline handle_t *__ext4_journal_start(void *icb, struct inode *inode,
 #define ext4_journal_stop(icb, handle) \
 	__ext4_journal_stop("", __LINE__, (icb), (handle))
 
+int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr);
+#define ext4_journal_revoke_block(handle, blocknr) \
+	__ext4_journal_revoke_block((handle), (blocknr))
+
 static inline int ext4_journal_extend(void *icb, handle_t *handle, int nblocks)
 {
 	return 0;

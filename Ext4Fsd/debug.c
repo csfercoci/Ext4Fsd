@@ -2619,10 +2619,21 @@ Ext2AllocatePool(
     IN ULONG Tag
 )
 {
-    PUCHAR  Buffer =  ExAllocatePoolWithTag(
-                          PoolType,
-                          0x20 + NumberOfBytes,
-                          Tag);
+    POOL_FLAGS PoolFlags;
+    PUCHAR Buffer;
+
+    if (PoolType == PagedPool)
+        PoolFlags = POOL_FLAG_PAGED;
+    else if (PoolType == NonPagedPool)
+        PoolFlags = POOL_FLAG_NON_PAGED;
+    else
+        PoolFlags = 0;
+
+    /* Use POOL_FLAG_UNINITIALIZED for performance —
+     * we initialize sentinel fields and callers expect
+     * Ext2AllocatePool tracking, not zeroed memory. */
+    Buffer = ExAllocatePool2(PoolFlags | POOL_FLAG_UNINITIALIZED,
+                              0x20 + NumberOfBytes, Tag);
     if (Buffer) {
         KIRQL   Irql = 0;
         PULONG  Data = (PULONG)Buffer;

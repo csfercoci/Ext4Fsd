@@ -259,7 +259,7 @@ static inline long IS_ERR(const void *ptr)
 
 #define BUG_ON(c) assert(!(c))
 
-#define WARN_ON(c) BUG_ON(c)
+#define WARN_ON(c) (assert(!(c)), !!(c))
 
 //
 // Linux module definitions
@@ -427,6 +427,7 @@ struct task_struct {
     pid_t tid;
     char comm[32];
     void * journal_info;
+    unsigned long flags;
 };
 
 extern struct task_struct *current;
@@ -729,6 +730,7 @@ struct buffer_head {
     void *b_private;		                /* reserved for b_end_io */
     // struct list_head b_assoc_buffers;    /* associated with another mapping */
     // struct address_space *b_assoc_map;   /* mapping this buffer is associated with */
+    struct buffer_head *b_this_page;        /* circular list of page's buffers */
     atomic_t b_count;		                /* users using this buffer_head */
     struct rb_node b_rb_node;               /* Red-black tree node entry */
 
@@ -1130,7 +1132,7 @@ struct kmem_cache {
     ULONG                   size;
     atomic_t                count;
     atomic_t                acount;
-    NPAGED_LOOKASIDE_LIST   la;
+    LOOKASIDE_LIST_EX       la;
     kmem_cache_cb_t         constructor;
 };
 

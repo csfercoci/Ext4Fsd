@@ -23,6 +23,13 @@ Ext2DeviceControlCompletion (
     IN PIRP             Irp,
     IN PVOID            Context);
 
+NTSTATUS
+Ext2ProcessUserProperty(
+    IN PEXT2_IRP_CONTEXT        IrpContext,
+    IN PEXT2_VOLUME_PROPERTY3   Property,
+    IN ULONG                    Length
+);
+
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, Ext2DeviceControl)

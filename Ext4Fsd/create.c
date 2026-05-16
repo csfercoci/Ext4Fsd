@@ -859,6 +859,7 @@ Ext2CreateFile(
     BOOLEAN             bDir = FALSE;
     BOOLEAN             bFcbAllocated = FALSE;
     BOOLEAN             bCreated = FALSE;
+    BOOLEAN             OwnsTxn = FALSE;
 
     BOOLEAN             bMainResourceAcquired = FALSE;
     BOOLEAN             bFcbLockAcquired = FALSE;
@@ -921,6 +922,10 @@ Ext2CreateFile(
     ShareAccess   = IrpSp->Parameters.Create.ShareAccess;
 
     *OpPostIrp = FALSE;
+
+    if (Vcb && Vcb->Identifier.Type == EXT2VCB && IsMounted(Vcb) && !IsVcbReadOnly(Vcb)) {
+        OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 64);
+    }
 
     __try {
 
@@ -1439,7 +1444,7 @@ Openit:
                                                IrpContext->Irp,
                                                IrpContext,
                                                Ext2OplockComplete,
-                                               Ext2LockIrp );
+                                               Ext2LockIrpCallback );
 
                     if ( Status != STATUS_SUCCESS &&
                             Status != STATUS_OPLOCK_BREAK_IN_PROGRESS) {
@@ -1575,7 +1580,7 @@ Openit:
                                                 IrpContext->Irp,
                                                 IrpContext,
                                                 Ext2OplockComplete,
-                                                Ext2LockIrp );
+                                                Ext2LockIrpCallback );
 
                     if ( Status != STATUS_SUCCESS &&
                             Status != STATUS_OPLOCK_BREAK_IN_PROGRESS) {
@@ -1833,6 +1838,10 @@ Openit:
         if (SymLink) {
             Ext2DerefMcb(SymLink);
         }
+
+        if (OwnsTxn) {
+            Ext2JournalStop(IrpContext, Vcb);
+        }
     }
 
     return Status;
@@ -2055,6 +2064,7 @@ Ext2CreateInode(
     struct inode Inode = { 0 };
     struct dentry *Dentry = NULL;
 	struct ext3_super_block *es = EXT3_SB(&Vcb->sb)->s_es;
+    BOOLEAN     OwnsTxn = FALSE;
 
     LARGE_INTEGER   SysTime;
 
@@ -2064,6 +2074,14 @@ Ext2CreateInode(
                    FileName->Buffer,
                    Parent->Mcb->ShortName.Buffer,
                    Parent->Inode->i_ino));
+
+    /*
+     * Open a journal transaction covering the inode allocation, dir
+     * entry insertion and inode body write. Budget: ~16 metadata
+     * blocks (inode bitmap, group desc, superblock, dir block(s),
+     * inode block, optional extent root, indirect blocks).
+     */
+    OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 16);
 
     Status = Ext2NewInode(IrpContext, Vcb, iGrp, Type, &iNo);
     if (!NT_SUCCESS(Status)) {
@@ -2132,6 +2150,9 @@ errorout:
 
     if (Dentry)
         Ext2FreeEntry(Dentry);
+
+    if (OwnsTxn)
+        Ext2JournalStop(IrpContext, Vcb);
 
     return Status;
 }

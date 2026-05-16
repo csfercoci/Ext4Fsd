@@ -89,7 +89,9 @@ static inline void ext_debug(char *str, ...)
 #endif
 
 #define ext4_std_error(s, err)
+#ifndef assert
 #define assert ASSERT
+#endif
 
 #endif
 

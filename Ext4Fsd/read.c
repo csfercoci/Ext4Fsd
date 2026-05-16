@@ -100,6 +100,10 @@ Ext2ReadVolume (IN PEXT2_IRP_CONTEXT IrpContext)
         FileObject = IrpContext->FileObject;
         FcbOrVcb = (PEXT2_FCBVCB) FileObject->FsContext;
         ASSERT(FcbOrVcb);
+        if (FcbOrVcb == NULL) {
+            Status = STATUS_INVALID_PARAMETER;
+            __leave;
+        }
 
         if (!(FcbOrVcb->Identifier.Type == EXT2VCB && (PVOID)FcbOrVcb == (PVOID)Vcb)) {
 
@@ -640,7 +644,7 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
                                        Irp,
                                        IrpContext,
                                        Ext2OplockComplete,
-                                       Ext2LockIrp );
+                                       Ext2LockIrpCallback );
 
             if (Status != STATUS_SUCCESS) {
                 OpPostIrp = TRUE;

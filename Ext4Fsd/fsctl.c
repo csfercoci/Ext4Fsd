@@ -1514,6 +1514,7 @@ Ext2WriteSymlink (
 {
     NTSTATUS Status = STATUS_SUCCESS;
     PUCHAR   Data = (PUCHAR)(&Mcb->Inode.i_block[0]);
+    BOOLEAN  OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
 
     if (Size >= EXT2_LINKLEN_IN_INODE) {
 
@@ -1552,6 +1553,9 @@ Ext2WriteSymlink (
     }
 
 out:
+    if (OwnsTxn) {
+        Ext2JournalStop(IrpContext, Vcb);
+    }
     return Status;
 }
 
@@ -1587,6 +1591,14 @@ Ext2SetReparsePoint (IN PEXT2_IRP_CONTEXT IrpContext)
 
     BOOLEAN             MainResourceAcquired = FALSE;
     BOOLEAN             FcbLockAcquired = FALSE;
+    BOOLEAN             OwnsTxn = FALSE;
+
+    {
+        PEXT2_VCB VcbStart = (PEXT2_VCB) IrpContext->DeviceObject->DeviceExtension;
+        if (VcbStart && VcbStart->Identifier.Type == EXT2VCB && IsMounted(VcbStart) && !IsVcbReadOnly(VcbStart)) {
+            OwnsTxn = Ext2JournalNestedStart(IrpContext, VcbStart, 32);
+        }
+    }
 
     __try {
 
@@ -1604,6 +1616,11 @@ Ext2SetReparsePoint (IN PEXT2_IRP_CONTEXT IrpContext)
         ExAcquireResourceExclusiveLite(&Vcb->FcbLock, TRUE);
         FcbLockAcquired = TRUE;
 
+        if (!Mcb) {
+            Status = STATUS_INVALID_PARAMETER;
+            __leave;
+        }
+
         ParentMcb = Mcb->Parent;
         ParentDcb = ParentMcb->Fcb;
         if (ParentDcb == NULL) {
@@ -1612,9 +1629,6 @@ Ext2SetReparsePoint (IN PEXT2_IRP_CONTEXT IrpContext)
         if (ParentDcb) {
             Ext2ReferXcb(&ParentDcb->ReferenceCount);
         }
-
-        if (!Mcb)
-            __leave;
 
         if (FcbLockAcquired) {
             ExReleaseResourceLite(&Vcb->FcbLock);
@@ -1729,8 +1743,12 @@ Ext2SetReparsePoint (IN PEXT2_IRP_CONTEXT IrpContext)
         if (ParentDcb) {
             Ext2ReleaseFcb(ParentDcb);
         }
+
+        if (OwnsTxn) {
+            Ext2JournalStop(IrpContext, (PEXT2_VCB) IrpContext->DeviceObject->DeviceExtension);
+        }
     }
-    
+
     return Status;
 }
 
@@ -1746,6 +1764,7 @@ Ext2TruncateSymlink(
     PUCHAR   data = (PUCHAR)&Mcb->Inode.i_block;
     ULONG    len = (ULONG)Mcb->Inode.i_size;
     LARGE_INTEGER NewSize;
+    BOOLEAN  OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
     
     if (len < EXT2_LINKLEN_IN_INODE && !Mcb->Inode.i_blocks) {
 
@@ -1762,6 +1781,9 @@ Ext2TruncateSymlink(
     }
     
 out:
+    if (OwnsTxn) {
+        Ext2JournalStop(IrpContext, Vcb);
+    }
     return status;
 }
 
@@ -1785,7 +1807,15 @@ Ext2DeleteReparsePoint (IN PEXT2_IRP_CONTEXT IrpContext)
 
     BOOLEAN             FcbLockAcquired = FALSE;
     BOOLEAN             MainResourceAcquired = FALSE;
+    BOOLEAN             OwnsTxn = FALSE;
     
+
+    {
+        PEXT2_VCB VcbStart = (PEXT2_VCB) IrpContext->DeviceObject->DeviceExtension;
+        if (VcbStart && VcbStart->Identifier.Type == EXT2VCB && IsMounted(VcbStart) && !IsVcbReadOnly(VcbStart)) {
+            OwnsTxn = Ext2JournalNestedStart(IrpContext, VcbStart, 32);
+        }
+    }
 
     __try {
 
@@ -1880,8 +1910,12 @@ Ext2DeleteReparsePoint (IN PEXT2_IRP_CONTEXT IrpContext)
         if (Fcb) {
             Ext2ReleaseFcb(Fcb);
         }
+
+        if (OwnsTxn) {
+            Ext2JournalStop(IrpContext, (PEXT2_VCB) IrpContext->DeviceObject->DeviceExtension);
+        }
     }
-    
+
     return Status;
 }
 

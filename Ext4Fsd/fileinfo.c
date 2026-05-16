@@ -110,6 +110,10 @@ Ext2QueryFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
         Ccb = (PEXT2_CCB) FileObject->FsContext2;
         ASSERT(Ccb != NULL);
+        if (Ccb == NULL) {
+            Status = STATUS_INVALID_PARAMETER;
+            __leave;
+        }
         ASSERT((Ccb->Identifier.Type == EXT2CCB) &&
                (Ccb->Identifier.Size == sizeof(EXT2_CCB)));
         Mcb = Ccb->SymLink;
@@ -516,6 +520,7 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
     BOOLEAN                 FcbMainResourceAcquired = FALSE;
     BOOLEAN                 FcbPagingIoResourceAcquired = FALSE;
+    BOOLEAN                 OwnsTxn = FALSE;
 
     __try {
 
@@ -524,6 +529,13 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
         ASSERT((IrpContext->Identifier.Type == EXT2ICX) &&
                (IrpContext->Identifier.Size == sizeof(EXT2_IRP_CONTEXT)));
         DeviceObject = IrpContext->DeviceObject;
+
+        /* start journal txn early; nested ops reuse our handle */
+        Vcb = (PEXT2_VCB) DeviceObject->DeviceExtension;
+        if (Vcb && Vcb->Identifier.Type == EXT2VCB && IsMounted(Vcb) && !IsVcbReadOnly(Vcb)) {
+            OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
+        }
+        Vcb = NULL;
 
         //
         // This request is not allowed on the main device object
@@ -1058,6 +1070,11 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                 Ext2CompleteIrpContext(IrpContext,  Status);
             }
         }
+
+        if (OwnsTxn) {
+            PEXT2_VCB VcbStop = (PEXT2_VCB) IrpContext->DeviceObject->DeviceExtension;
+            Ext2JournalStop(IrpContext, VcbStop);
+        }
     }
 
     return Status;
@@ -1197,6 +1214,9 @@ Ext2TruncateFile(
 )
 {
     NTSTATUS status = STATUS_SUCCESS;
+    BOOLEAN  OwnsTxn = FALSE;
+
+    OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
 
     if (INODE_HAS_EXTENT(&Mcb->Inode)) {
 		status = Ext2TruncateExtent(IrpContext, Vcb, Mcb, Size);
@@ -1218,6 +1238,10 @@ Ext2TruncateFile(
         }
         Ext2ClearAllExtents(&Mcb->MetaExts);
         ClearLongFlag(Mcb->Flags, MCB_ZONE_INITED);
+    }
+
+    if (OwnsTxn) {
+        Ext2JournalStop(IrpContext, Vcb);
     }
 
     return status;
@@ -1925,6 +1949,7 @@ Ext2DeleteFile(
     LARGE_INTEGER   SysTime;
 
     BOOLEAN         bFcbLockAcquired = FALSE;
+    BOOLEAN         OwnsTxn = FALSE;
 
     DEBUG(DL_INF, ( "Ext2DeleteFile: File %wZ (%xh) will be deleted!\n",
                     &Mcb->FullName, Mcb->Inode.i_ino));
@@ -1938,6 +1963,13 @@ Ext2DeleteFile(
             return STATUS_DIRECTORY_NOT_EMPTY;
         }
     }
+
+    /*
+     * Open journal transaction covering: dir entry removal, inode body
+     * updates, truncate-driven block frees, inode bitmap free,
+     * group desc / superblock updates. Budget generous: ~32 blocks.
+     */
+    OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
 
     __try {
 
@@ -2011,6 +2043,11 @@ Ext2DeleteFile(
 
             if (S_ISLNK(Mcb->Inode.i_mode)) {
 
+                /* mark inode pending delete + add to orphan list so a
+                   crash mid-truncate can be finished on next mount */
+                Mcb->Inode.i_nlink = 0;
+                Ext2OrphanAdd(IrpContext, Vcb, &Mcb->Inode);
+
                 /* for symlink, we should do differenctly  */
                 if (Mcb->Inode.i_size > EXT2_LINKLEN_IN_INODE) {
                     Size.QuadPart = (LONGLONG)0;
@@ -2018,6 +2055,9 @@ Ext2DeleteFile(
                 }
 
             } else {
+
+                Mcb->Inode.i_nlink = 0;
+                Ext2OrphanAdd(IrpContext, Vcb, &Mcb->Inode);
 
                 /* truncate file size */
                 Size.QuadPart = (LONGLONG)0;
@@ -2046,6 +2086,9 @@ Ext2DeleteFile(
             /* set delete time and free the inode */
             KeQuerySystemTime(&SysTime);
             Mcb->Inode.i_nlink = 0;
+            /* Splice off orphan list before stamping i_dtime — same field
+               is reused as NEXT_ORPHAN while on chain. */
+            Ext2OrphanDel(IrpContext, Vcb, &Mcb->Inode);
             /* i_dtime is only the lower 32-bits because it is used as a relative time */
             { ULONG dummy; Ext2TimeToSecondsSince1970(&SysTime, &Mcb->Inode.i_dtime, &dummy); }
             Ext2SaveInode(IrpContext, Vcb, &Mcb->Inode);
@@ -2079,6 +2122,9 @@ Ext2DeleteFile(
         }
 
         Ext2DerefMcb(Mcb);
+
+        if (OwnsTxn)
+            Ext2JournalStop(IrpContext, Vcb);
     }
 
     DEBUG(DL_INF, ( "Ext2DeleteFile: %wZ Succeed... EXT2SB->S_FREE_BLOCKS = %I64xh .\n",

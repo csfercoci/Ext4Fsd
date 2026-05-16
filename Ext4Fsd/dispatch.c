@@ -53,7 +53,15 @@ Ext2OplockComplete (
         //  queue the Irp context in the workqueue.
         //
 
-        Ext2QueueRequest((PEXT2_IRP_CONTEXT)Context);
+        if (!NT_SUCCESS(Ext2QueueRequest((PEXT2_IRP_CONTEXT)Context))) {
+
+            //
+            //  queue failed, complete the request
+            //
+
+            Ext2CompleteIrpContext( (PEXT2_IRP_CONTEXT) Context,
+                                    Irp->IoStatus.Status );
+        }
 
     } else {
 
@@ -82,7 +90,7 @@ Ext2OplockComplete (
  *    N/A
  */
 
-VOID
+NTSTATUS
 Ext2LockIrp (
     IN PVOID Context,
     IN PIRP Irp
@@ -90,9 +98,10 @@ Ext2LockIrp (
 {
     PIO_STACK_LOCATION IrpSp;
     PEXT2_IRP_CONTEXT IrpContext;
+    NTSTATUS Status = STATUS_SUCCESS;
 
     if (Irp == NULL) {
-        return;
+        return STATUS_INVALID_PARAMETER;
     }
 
     IrpSp = IoGetCurrentIrpStackLocation(Irp);
@@ -108,7 +117,7 @@ Ext2LockIrp (
 
         if (!IsFlagOn(IrpContext->MinorFunction, IRP_MN_MDL)) {
 
-            Ext2LockUserBuffer( Irp, IrpSp->Parameters.Write.Length,
+            Status = Ext2LockUserBuffer( Irp, IrpSp->Parameters.Write.Length,
                                 (IrpContext->MajorFunction == IRP_MJ_READ) ?
                                 IoWriteAccess : IoReadAccess );
         }
@@ -117,16 +126,16 @@ Ext2LockIrp (
                && IrpContext->MinorFunction == IRP_MN_QUERY_DIRECTORY) {
 
         ULONG Length = ((PEXTENDED_IO_STACK_LOCATION) IrpSp)->Parameters.QueryDirectory.Length;
-        Ext2LockUserBuffer(Irp, Length, IoWriteAccess);
+        Status = Ext2LockUserBuffer(Irp, Length, IoWriteAccess);
 
     } else if (IrpContext->MajorFunction == IRP_MJ_QUERY_EA) {
 
         ULONG Length = ((PEXTENDED_IO_STACK_LOCATION) IrpSp)->Parameters.QueryEa.Length;
-        Ext2LockUserBuffer(Irp, Length, IoWriteAccess);
+        Status = Ext2LockUserBuffer(Irp, Length, IoWriteAccess);
 
     } else if (IrpContext->MajorFunction == IRP_MJ_SET_EA) {
         ULONG Length = ((PEXTENDED_IO_STACK_LOCATION) IrpSp)->Parameters.SetEa.Length;
-        Ext2LockUserBuffer(Irp, Length, IoReadAccess);
+        Status = Ext2LockUserBuffer(Irp, Length, IoReadAccess);
 
     } else if ( (IrpContext->MajorFunction == IRP_MJ_FILE_SYSTEM_CONTROL) &&
                 (IrpContext->MinorFunction == IRP_MN_USER_FS_REQUEST) ) {
@@ -135,7 +144,7 @@ Ext2LockIrp (
                 (EIrpSp->Parameters.FileSystemControl.FsControlCode == FSCTL_GET_RETRIEVAL_POINTERS) ||
                 (EIrpSp->Parameters.FileSystemControl.FsControlCode == FSCTL_GET_RETRIEVAL_POINTER_BASE) ) {
             ULONG Length = EIrpSp->Parameters.FileSystemControl.OutputBufferLength;
-            Ext2LockUserBuffer(Irp, Length, IoWriteAccess);
+            Status = Ext2LockUserBuffer(Irp, Length, IoWriteAccess);
         }
     }
 
@@ -143,12 +152,23 @@ Ext2LockIrp (
 
     IoMarkIrpPending( Irp );
 
-    return;
+    return Status;
+}
+
+VOID
+Ext2LockIrpCallback (
+    IN PVOID Context,
+    IN PIRP Irp
+)
+{
+    Ext2LockIrp(Context, Irp);
 }
 
 NTSTATUS
 Ext2QueueRequest (IN PEXT2_IRP_CONTEXT IrpContext)
 {
+    NTSTATUS Status;
+
     ASSERT(IrpContext);
 
     ASSERT((IrpContext->Identifier.Type == EXT2ICX) &&
@@ -159,7 +179,10 @@ Ext2QueueRequest (IN PEXT2_IRP_CONTEXT IrpContext)
     SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_REQUEUED);
 
     /* make sure the buffer is kept valid in system context */
-    Ext2LockIrp(IrpContext, IrpContext->Irp);
+    Status = Ext2LockIrp(IrpContext, IrpContext->Irp);
+    if (!NT_SUCCESS(Status)) {
+        return Status;
+    }
 
     /* initialize workite*/
     ExInitializeWorkItem(

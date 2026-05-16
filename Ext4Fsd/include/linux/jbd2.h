@@ -17,53 +17,14 @@
 #define _LINUX_JBD2_H
 
 /* Allow this file to be included directly into e2fsprogs */
-#ifndef __KERNEL__
-#include "jfs_compat.h"
-#define JBD2_DEBUG
-#else
-
-#include <linux/types.h>
-//#include <linux/buffer_head.h>
-#include <linux/journal-head.h>
-#include <linux/stddef.h>
-//#include <linux/mutex.h>
-//#include <linux/timer.h>
-//#include <linux/slab.h>
 #include <linux/bit_spinlock.h>
 #include <linux/module.h>
-#endif
 
-#define KMEM_CACHE(__struct, __flags) kmem_cache_create(#__struct,\
-		sizeof(struct __struct), 0,\
-		(__flags), NULL)
-
-#define kmalloc_array(num, size, flags) kmalloc((num) * (size), flags)
-
-struct hlist_node {
-	struct hlist_node *next, **pprev;
-};
-
-/*
- * A lockdep key is associated with each lock object. For static locks we use
- * the lock address itself as the key. Dynamically allocated lock objects can
- * have a statically or dynamically allocated key. Dynamically allocated lock
- * keys must be registered before being used and must be unregistered before
- * the key memory is freed.
- */
-struct lockdep_subclass_key {
-	char __one_byte;
-} __attribute__ ((__packed__));
-
-#define MAX_LOCKDEP_SUBCLASSES	8UL
-/* hash_entry is used to keep track of dynamically allocated keys. */
-struct lock_class_key {
-	union {
-		struct hlist_node		hash_entry;
-		struct lockdep_subclass_key	subkeys[MAX_LOCKDEP_SUBCLASSES];
-	};
-};
+#include "../../jbd2_compat.h"
+#include <linux/journal-head.h>
 
 #define journal_oom_retry 1
+
 
 /*
  * Define JBD2_PARANIOD_IOFAIL to cause a kernel BUG() if ext4 finds
@@ -336,6 +297,7 @@ typedef struct journal_superblock_s
 #ifdef __KERNEL__
 
 #include <linux/fs.h>
+#include <linux/journal-head.h>
 //#include <linux/sched.h>
 
 enum jbd_state_bits {
@@ -486,6 +448,8 @@ struct jbd2_inode {
 	 * @i_flags: Flags of inode [j_list_lock]
 	 */
 	unsigned long i_flags;
+	loff_t i_dirty_start;
+	loff_t i_dirty_end;
 };
 
 struct jbd2_revoke_table_s;
@@ -682,6 +646,7 @@ struct transaction_s
 	 * When transaction started
 	 */
 	unsigned long		t_start;
+	ktime_t			t_start_time;
 
 	/*
 	 * When commit was requested
@@ -811,7 +776,13 @@ struct journal_s
 	/**
 	 * @j_state_lock: Protect the various scalars in the journal.
 	 */
-	//rwlock_t		j_state_lock;
+	rwlock_t		j_state_lock;
+
+	/**
+	 * @j_trans_commit_map:
+	 */
+	struct rw_semaphore	j_trans_commit_map;
+
 
 	/**
 	 * @j_barrier_count:
@@ -1670,16 +1641,12 @@ static inline tid_t  jbd2_get_latest_transaction(journal_t *journal)
 	return tid;
 }
 
-#ifdef __KERNEL__
-
 #define buffer_trace_init(bh)	do {} while (0)
 #define print_buffer_fields(bh)	do {} while (0)
 #define print_buffer_trace(bh)	do {} while (0)
 #define BUFFER_TRACE(bh, info)	do {} while (0)
 #define BUFFER_TRACE2(bh, bh2, info)	do {} while (0)
 #define JBUFFER_TRACE(jh, info)	do {} while (0)
-
-#endif	/* __KERNEL__ */
 
 #define EFSBADCRC	EBADMSG		/* Bad CRC detected */
 #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */

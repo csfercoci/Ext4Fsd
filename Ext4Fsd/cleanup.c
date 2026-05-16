@@ -385,7 +385,10 @@ Ext2Cleanup (IN PEXT2_IRP_CONTEXT IrpContext)
 
         if (!IrpContext->ExceptionInProgress) {
             if (Status == STATUS_PENDING) {
-                Ext2QueueRequest(IrpContext);
+                if (!NT_SUCCESS(Ext2QueueRequest(IrpContext))) {
+                    IrpContext->Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+                    Ext2CompleteIrpContext(IrpContext, STATUS_INSUFFICIENT_RESOURCES);
+                }
             } else {
                 IrpContext->Irp->IoStatus.Status = Status;
                 Ext2CompleteIrpContext(IrpContext, Status);

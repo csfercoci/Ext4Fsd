@@ -98,7 +98,9 @@ Ext2ShutDown (IN PEXT2_IRP_CONTEXT IrpContext)
 
         if (!IrpContext->ExceptionInProgress) {
             if (Status == STATUS_PENDING) {
-                Ext2QueueRequest(IrpContext);
+                if (!NT_SUCCESS(Ext2QueueRequest(IrpContext))) {
+                    Ext2CompleteIrpContext(IrpContext, STATUS_INSUFFICIENT_RESOURCES);
+                }
             } else {
                 Ext2CompleteIrpContext(IrpContext, Status);
             }

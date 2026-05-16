@@ -210,7 +210,10 @@ Ext2DeferWrite(IN PEXT2_IRP_CONTEXT IrpContext, PIRP Irp)
 {
     ASSERT(IrpContext->Irp == Irp);
 
-    Ext2QueueRequest(IrpContext);
+    if (!NT_SUCCESS(Ext2QueueRequest(IrpContext))) {
+        IrpContext->Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        Ext2CompleteIrpContext(IrpContext, STATUS_INSUFFICIENT_RESOURCES);
+    }
 }
 
 NTSTATUS
@@ -257,6 +260,10 @@ Ext2WriteVolume (IN PEXT2_IRP_CONTEXT IrpContext)
         FileObject = IrpContext->FileObject;
         FcbOrVcb = (PEXT2_FCBVCB) FileObject->FsContext;
         ASSERT(FcbOrVcb);
+        if (FcbOrVcb == NULL) {
+            Status = STATUS_INVALID_PARAMETER;
+            __leave;
+        }
 
         if (!(FcbOrVcb->Identifier.Type == EXT2VCB && (PVOID)FcbOrVcb == (PVOID)Vcb)) {
             Status = STATUS_INVALID_DEVICE_REQUEST;
@@ -768,6 +775,7 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
     BOOLEAN             UpdateFileValidSize = FALSE;
     BOOLEAN             FileSizesChanged = FALSE;
     BOOLEAN             rc;
+    BOOLEAN             OwnsExpandTxn = FALSE;
 
 
     __try {
@@ -987,7 +995,7 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                                            Irp,
                                            IrpContext,
                                            Ext2OplockComplete,
-                                           Ext2LockIrp );
+                                           Ext2LockIrpCallback );
 
                 if (Status != STATUS_SUCCESS) {
                     OpPostIrp = TRUE;
@@ -1026,41 +1034,44 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
 
                 /* tell Ext2ExpandFile to allocate unwritten extent or NULL blocks
                    for indirect files, otherwise we might get gabage data in holes */
-                IrpContext->MajorFunction += IRP_MJ_MAXIMUM_FUNCTION;
-                Status = Ext2ExpandFile(IrpContext, Vcb, Fcb->Mcb, &AllocationSize);
-                IrpContext->MajorFunction -= IRP_MJ_MAXIMUM_FUNCTION;
-                if (AllocationSize.QuadPart > Last.QuadPart) {
-                    Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
-                    SetLongFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
-                }
-                ExReleaseResourceLite(&Fcb->PagingIoResource);
-                PagingIoResourceAcquired = FALSE;
-
-                if (ByteOffset.QuadPart >= Fcb->Header.AllocationSize.QuadPart) {
-                    if (NT_SUCCESS(Status)) {
-                        DbgBreak();
-                        Status = STATUS_UNSUCCESSFUL;
+                {
+                    OwnsExpandTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
+                    IrpContext->MajorFunction += IRP_MJ_MAXIMUM_FUNCTION;
+                    Status = Ext2ExpandFile(IrpContext, Vcb, Fcb->Mcb, &AllocationSize);
+                    IrpContext->MajorFunction -= IRP_MJ_MAXIMUM_FUNCTION;
+                    if (AllocationSize.QuadPart > Last.QuadPart) {
+                        Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
+                        SetLongFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
                     }
-                    __leave;
-                }
+                    ExReleaseResourceLite(&Fcb->PagingIoResource);
+                    PagingIoResourceAcquired = FALSE;
 
-                if (ByteOffset.QuadPart + Length > Fcb->Header.AllocationSize.QuadPart) {
-                    Length = (ULONG)(Fcb->Header.AllocationSize.QuadPart - ByteOffset.QuadPart);
-                }
+                    if (ByteOffset.QuadPart >= Fcb->Header.AllocationSize.QuadPart) {
+                        if (NT_SUCCESS(Status)) {
+                            DbgBreak();
+                            Status = STATUS_UNSUCCESSFUL;
+                        }
+                        __leave;
+                    }
 
-                Fcb->Header.FileSize.QuadPart = Fcb->Inode->i_size = ByteOffset.QuadPart + Length;
+                    if (ByteOffset.QuadPart + Length > Fcb->Header.AllocationSize.QuadPart) {
+                        Length = (ULONG)(Fcb->Header.AllocationSize.QuadPart - ByteOffset.QuadPart);
+                    }
 
-                if (CcIsFileCached(FileObject)) {
-                    CcSetFileSizes(FileObject, (PCC_FILE_SIZES)(&(Fcb->Header.AllocationSize)));
-                }
+                    Fcb->Header.FileSize.QuadPart = Fcb->Inode->i_size = ByteOffset.QuadPart + Length;
 
-                FileObject->Flags |= FO_FILE_SIZE_CHANGED | FO_FILE_MODIFIED;
-                FileSizesChanged = TRUE;
+                    if (CcIsFileCached(FileObject)) {
+                        CcSetFileSizes(FileObject, (PCC_FILE_SIZES)(&(Fcb->Header.AllocationSize)));
+                    }
 
-                if (Fcb->Header.FileSize.QuadPart >= 0x80000000 &&
-                        !IsFlagOn(SUPER_BLOCK->s_feature_ro_compat, EXT2_FEATURE_RO_COMPAT_LARGE_FILE)) {
-                    SetFlag(SUPER_BLOCK->s_feature_ro_compat, EXT2_FEATURE_RO_COMPAT_LARGE_FILE);
-                    Ext2SaveSuper(IrpContext, Vcb);
+                    FileObject->Flags |= FO_FILE_SIZE_CHANGED | FO_FILE_MODIFIED;
+                    FileSizesChanged = TRUE;
+
+                    if (Fcb->Header.FileSize.QuadPart >= 0x80000000 &&
+                            !IsFlagOn(SUPER_BLOCK->s_feature_ro_compat, EXT2_FEATURE_RO_COMPAT_LARGE_FILE)) {
+                        SetFlag(SUPER_BLOCK->s_feature_ro_compat, EXT2_FEATURE_RO_COMPAT_LARGE_FILE);
+                        Ext2SaveSuper(IrpContext, Vcb);
+                    }
                 }
 
                 DEBUG(DL_IO, ("Ext2WriteFile: expanding %wZ to FS: %I64xh FA: %I64xh\n",
@@ -1291,6 +1302,8 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                 Ext2FreeIrpContext(IrpContext);
             }
         }
+
+        if (OwnsExpandTxn) Ext2JournalStop(IrpContext, Vcb);
     }
 
     DEBUG(DL_IO, ("Ext2WriteFile: %wZ written at Offset=%I64xh Length=%xh PagingIo=%d Nocache=%d "

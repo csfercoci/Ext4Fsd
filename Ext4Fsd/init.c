@@ -80,12 +80,12 @@ DriverUnload (IN PDRIVER_OBJECT DriverObject)
 
     ExDeleteResourceLite(&Ext2Global->Resource);
 
-    ExDeleteNPagedLookasideList(&(Ext2Global->Ext2DentryLookasideList));
-    ExDeleteNPagedLookasideList(&(Ext2Global->Ext2ExtLookasideList));
-    ExDeleteNPagedLookasideList(&(Ext2Global->Ext2McbLookasideList));
-    ExDeleteNPagedLookasideList(&(Ext2Global->Ext2CcbLookasideList));
-    ExDeleteNPagedLookasideList(&(Ext2Global->Ext2FcbLookasideList));
-    ExDeleteNPagedLookasideList(&(Ext2Global->Ext2IrpContextLookasideList));
+    ExDeleteLookasideListEx(&(Ext2Global->Ext2DentryLookasideList));
+    ExDeleteLookasideListEx(&(Ext2Global->Ext2ExtLookasideList));
+    ExDeleteLookasideListEx(&(Ext2Global->Ext2McbLookasideList));
+    ExDeleteLookasideListEx(&(Ext2Global->Ext2CcbLookasideList));
+    ExDeleteLookasideListEx(&(Ext2Global->Ext2FcbLookasideList));
+    ExDeleteLookasideListEx(&(Ext2Global->Ext2IrpContextLookasideList));
 
     ObDereferenceObject(Ext2Global->DiskdevObject);
     ObDereferenceObject(Ext2Global->CdromdevObject);
@@ -713,53 +713,59 @@ DriverEntry (
     // Initialize the global data
     //
 
-    ExInitializeNPagedLookasideList( &(Ext2Global->Ext2IrpContextLookasideList),
-                                     NULL,
-                                     NULL,
-                                     0,
-                                     sizeof(EXT2_IRP_CONTEXT),
-                                     'PRIE',
-                                     0 );
+    ExInitializeLookasideListEx( &(Ext2Global->Ext2IrpContextLookasideList),
+                                 NULL,
+                                 NULL,
+                                 NonPagedPool,
+                                 0,
+                                 sizeof(EXT2_IRP_CONTEXT),
+                                 'PRIE',
+                                 0 );
 
-    ExInitializeNPagedLookasideList( &(Ext2Global->Ext2FcbLookasideList),
-                                     NULL,
-                                     NULL,
-                                     0,
-                                     sizeof(EXT2_FCB),
-                                     'BCFE',
-                                     0 );
+    ExInitializeLookasideListEx( &(Ext2Global->Ext2FcbLookasideList),
+                                 NULL,
+                                 NULL,
+                                 NonPagedPool,
+                                 0,
+                                 sizeof(EXT2_FCB),
+                                 'BCFE',
+                                 0 );
 
-    ExInitializeNPagedLookasideList( &(Ext2Global->Ext2CcbLookasideList),
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(EXT2_CCB),
-                                    'BCCE',
-                                    0 );
+    ExInitializeLookasideListEx( &(Ext2Global->Ext2CcbLookasideList),
+                                NULL,
+                                NULL,
+                                NonPagedPool,
+                                0,
+                                sizeof(EXT2_CCB),
+                                'BCCE',
+                                0 );
 
-    ExInitializeNPagedLookasideList( &(Ext2Global->Ext2McbLookasideList),
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(EXT2_MCB),
-                                    'BCME',
-                                    0 );
+    ExInitializeLookasideListEx( &(Ext2Global->Ext2McbLookasideList),
+                                NULL,
+                                NULL,
+                                NonPagedPool,
+                                0,
+                                sizeof(EXT2_MCB),
+                                'BCME',
+                                0 );
 
-    ExInitializeNPagedLookasideList( &(Ext2Global->Ext2ExtLookasideList),
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(EXT2_EXTENT),
-                                    'STXE',
-                                    0 );
+    ExInitializeLookasideListEx( &(Ext2Global->Ext2ExtLookasideList),
+                                NULL,
+                                NULL,
+                                NonPagedPool,
+                                0,
+                                sizeof(EXT2_EXTENT),
+                                'STXE',
+                                0 );
 
-    ExInitializeNPagedLookasideList( &(Ext2Global->Ext2DentryLookasideList),
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    sizeof(struct dentry),
-                                    'TNED',
-                                    0 );
+    ExInitializeLookasideListEx( &(Ext2Global->Ext2DentryLookasideList),
+                                NULL,
+                                NULL,
+                                NonPagedPool,
+                                0,
+                                sizeof(struct dentry),
+                                'TNED',
+                                0 );
 
     RtlInitUnicodeString(&DosDeviceName, DOS_DEVICE_NAME);
     IoCreateSymbolicLink(&DosDeviceName, &DeviceName);

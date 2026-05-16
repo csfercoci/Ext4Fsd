@@ -60,10 +60,11 @@ kmem_cache_create(
     }
 
     memset(kc, 0, sizeof(kmem_cache_t));
-    ExInitializeNPagedLookasideList(
+    ExInitializeLookasideListEx(
         &kc->la,
         NULL,
         NULL,
+        NonPagedPool,
         0,
         size,
         'JBKC',
@@ -83,7 +84,7 @@ int kmem_cache_destroy(kmem_cache_t * kc)
     if (kc == NULL)
         return 0;
 
-    ExDeleteNPagedLookasideList(&(kc->la));
+    ExDeleteLookasideListEx(&(kc->la));
     kfree(kc);
 
     return 0;
@@ -92,7 +93,7 @@ int kmem_cache_destroy(kmem_cache_t * kc)
 void* kmem_cache_alloc(kmem_cache_t *kc, int flags)
 {
     PVOID  ptr = NULL;
-    ptr = ExAllocateFromNPagedLookasideList(&(kc->la));
+    ptr = ExAllocateFromLookasideListEx(&(kc->la));
     if (ptr) {
         atomic_inc(&kc->count);
         atomic_inc(&kc->acount);
@@ -104,7 +105,7 @@ void kmem_cache_free(kmem_cache_t *kc, void *p)
 {
     if (p) {
         atomic_dec(&kc->count);
-        ExFreeToNPagedLookasideList(&(kc->la), p);
+        ExFreeToLookasideListEx(&(kc->la), p);
     }
 }
 

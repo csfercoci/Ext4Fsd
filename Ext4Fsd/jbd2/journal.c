@@ -2749,6 +2749,115 @@ static void __exit journal_exit(void)
     //DbgPrint("journal_exit: end\n");
 }
 
+/*
+ * Stub implementations for functions whose real code is inside #if 0
+ * blocks or not yet ported from Linux. These replace the inline stubs
+ * that were previously in jbd2.h (which shadowed extern declarations
+ * and silently made all JBD2 paths no-ops).
+ */
+
+/*
+ * Wait for a specified commit to complete.
+ * Stub: returns 0 immediately. journal_commit_sync() in ext4_jbd2.c
+ * writes all blocks synchronously before jbd2_journal_stop() returns,
+ * so no waiting is needed in the current architecture.
+ */
+int jbd2_log_wait_commit(journal_t *journal, tid_t tid)
+{
+	return 0;
+}
+
+/*
+ * Give a buffer_head a journal_head. Elevates b_jcount by one.
+ */
+struct journal_head *jbd2_journal_add_journal_head(struct buffer_head *bh)
+{
+	struct journal_head *jh;
+
+	if (buffer_jbd(bh)) {
+		jh = bh2jh(bh);
+	} else {
+		jh = kmem_cache_zalloc(jbd2_journal_head_cache, GFP_NOFS);
+		if (!jh)
+			return NULL;
+		set_buffer_jbd(bh);
+		bh->b_private = jh;
+		jh->b_bh = bh;
+		get_bh(bh);
+	}
+	jh->b_jcount++;
+	return jh;
+}
+
+/*
+ * Grab a ref against this buffer_head's journal_head.  Returns NULL if
+ * the buffer has no journal_head.
+ */
+struct journal_head *jbd2_journal_grab_journal_head(struct buffer_head *bh)
+{
+	struct journal_head *jh = NULL;
+
+	if (buffer_jbd(bh)) {
+		jh = bh2jh(bh);
+		jh->b_jcount++;
+	}
+	return jh;
+}
+
+/*
+ * Drop a reference on the passed journal_head.  If it fell to zero,
+ * release the journal_head from the buffer_head.
+ */
+void jbd2_journal_put_journal_head(struct journal_head *jh)
+{
+	struct buffer_head *bh = jh2bh(jh);
+
+	J_ASSERT_JH(jh, jh->b_jcount > 0);
+	--jh->b_jcount;
+	if (!jh->b_jcount) {
+		if (jh->b_frozen_data) {
+			jbd2_free(jh->b_frozen_data, bh->b_size);
+			jh->b_frozen_data = NULL;
+		}
+		if (jh->b_committed_data) {
+			jbd2_free(jh->b_committed_data, bh->b_size);
+			jh->b_committed_data = NULL;
+		}
+		bh->b_private = NULL;
+		jh->b_bh = NULL;
+		clear_buffer_jbd(bh);
+		kmem_cache_free(jbd2_journal_head_cache, jh);
+		__brelse(bh);
+	}
+}
+
+/*
+ * Cancel a revoke record for the given journal_head.
+ * Stub: returns -ENOENT. Real implementation in revoke.c:433 is inside
+ * an #if 0 block and is not yet compiled.
+ */
+int jbd2_journal_cancel_revoke(handle_t *handle, struct journal_head *jh)
+{
+	return -2; /* -ENOENT */
+}
+
+/*
+ * Remove a journal_head from the checkpoint list.
+ * Stub: returns 0. Real implementation requires checkpoint.c (not ported).
+ */
+int __jbd2_journal_remove_checkpoint(struct journal_head *jh)
+{
+	return 0;
+}
+
+/*
+ * Wait until there is space in the journal.
+ * Stub: returns immediately. Real implementation not yet ported.
+ */
+void __jbd2_log_wait_for_space(journal_t *journal)
+{
+}
+
 MODULE_LICENSE("GPL");
 module_init(journal_init);
 module_exit(journal_exit);

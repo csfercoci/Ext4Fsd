@@ -133,11 +133,19 @@ Ext2QueryEa (
 
 		Ccb = IrpContext->Ccb;
 		ASSERT(Ccb != NULL);
+		if (Ccb == NULL) {
+			Status = STATUS_INVALID_PARAMETER;
+			__leave;
+		}
 		ASSERT((Ccb->Identifier.Type == EXT2CCB) &&
 			(Ccb->Identifier.Size == sizeof(EXT2_CCB)));
 		DeviceObject = IrpContext->DeviceObject;
 		Vcb = (PEXT2_VCB)DeviceObject->DeviceExtension;
 		Fcb = IrpContext->Fcb;
+		if (Fcb == NULL) {
+			Status = STATUS_INVALID_PARAMETER;
+			__leave;
+		}
 		Mcb = Fcb->Mcb;
 		Irp = IrpContext->Irp;
 		IrpSp = IoGetCurrentIrpStackLocation(Irp);

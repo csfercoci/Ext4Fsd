@@ -44,7 +44,7 @@ Ext2AllocateIrpContext (IN PDEVICE_OBJECT   DeviceObject,
     irpSp = IoGetCurrentIrpStackLocation(Irp);
 
     IrpContext = (PEXT2_IRP_CONTEXT) (
-                     ExAllocateFromNPagedLookasideList(
+                     ExAllocateFromLookasideListEx(
                          &(Ext2Global->Ext2IrpContextLookasideList)));
 
     if (IrpContext == NULL) {
@@ -123,7 +123,7 @@ Ext2FreeIrpContext (IN PEXT2_IRP_CONTEXT IrpContext)
     IrpContext->Identifier.Size = 0;
 
     DEC_IRP_COUNT(IrpContext);
-    ExFreeToNPagedLookasideList(&(Ext2Global->Ext2IrpContextLookasideList), IrpContext);
+    ExFreeToLookasideListEx(&(Ext2Global->Ext2IrpContextLookasideList), IrpContext);
 }
 
 PEXT2_FCB
@@ -136,7 +136,7 @@ Ext2AllocateFcb (
 
     ASSERT(ExIsResourceAcquiredExclusiveLite(&Vcb->FcbLock));
 
-    Fcb = (PEXT2_FCB) ExAllocateFromNPagedLookasideList(
+    Fcb = (PEXT2_FCB) ExAllocateFromLookasideListEx(
               &(Ext2Global->Ext2FcbLookasideList));
 
     if (!Fcb) {
@@ -257,7 +257,7 @@ Ext2FreeFcb (IN PEXT2_FCB Fcb)
         Fcb->Identifier.Type = 0;
         Fcb->Identifier.Size = 0;
 
-        ExFreeToNPagedLookasideList(&(Ext2Global->Ext2FcbLookasideList), Fcb);
+        ExFreeToLookasideListEx(&(Ext2Global->Ext2FcbLookasideList), Fcb);
         DEC_MEM_COUNT(PS_FCB, Fcb, sizeof(EXT2_FCB));
 
         if (0 == Ext2DerefXcb(&Vcb->ReferenceCount)) {
@@ -319,7 +319,7 @@ Ext2AllocateCcb (ULONG Flags, PEXT2_MCB SymLink)
 {
     PEXT2_CCB Ccb;
 
-    Ccb = (PEXT2_CCB) (ExAllocateFromNPagedLookasideList(
+    Ccb = (PEXT2_CCB) (ExAllocateFromLookasideListEx(
                            &(Ext2Global->Ext2CcbLookasideList)));
     if (!Ccb) {
         return NULL;
@@ -377,7 +377,7 @@ Ext2FreeCcb (IN PEXT2_VCB Vcb, IN PEXT2_CCB Ccb)
         Ext2FreePool(Ccb->DirectorySearchPattern.Buffer, EXT2_DIRSP_MAGIC);
     }
 
-    ExFreeToNPagedLookasideList(&(Ext2Global->Ext2CcbLookasideList), Ccb);
+    ExFreeToLookasideListEx(&(Ext2Global->Ext2CcbLookasideList), Ccb);
     DEC_MEM_COUNT(PS_CCB, Ccb, sizeof(EXT2_CCB));
 }
 
@@ -386,7 +386,7 @@ Ext2AllocateInode (PEXT2_VCB  Vcb)
 {
     PVOID inode = NULL;
 
-    inode = ExAllocateFromNPagedLookasideList(
+    inode = ExAllocateFromLookasideListEx(
                 &(Vcb->InodeLookasideList));
     if (!inode) {
         return NULL;
@@ -407,7 +407,7 @@ Ext2DestroyInode (IN PEXT2_VCB Vcb, IN PEXT2_INODE inode)
 
     DEBUG(DL_INF, ("Ext2FreeInode: Inode = %ph.\n", inode));
 
-    ExFreeToNPagedLookasideList(&(Vcb->InodeLookasideList), inode);
+    ExFreeToLookasideListEx(&(Vcb->InodeLookasideList), inode);
     DEC_MEM_COUNT(PS_EXT2_INODE, inode, INODE_SIZE);
 }
 
@@ -415,7 +415,7 @@ struct dentry * Ext2AllocateEntry()
 {
     struct dentry *de;
 
-    de = (struct dentry *)ExAllocateFromNPagedLookasideList(
+    de = (struct dentry *)ExAllocateFromLookasideListEx(
              &(Ext2Global->Ext2DentryLookasideList));
     if (!de) {
         return NULL;
@@ -434,7 +434,7 @@ VOID Ext2FreeEntry (IN struct dentry *de)
     if (de->d_name.name)
         Ext2FreePool(de->d_name.name, 'EB2E');
 
-    ExFreeToNPagedLookasideList(&(Ext2Global->Ext2DentryLookasideList), de);
+    ExFreeToLookasideListEx(&(Ext2Global->Ext2DentryLookasideList), de);
     DEC_MEM_COUNT(PS_DENTRY, de, sizeof(struct dentry));
 }
 
@@ -486,7 +486,7 @@ Ext2AllocateExtent ()
 {
     PEXT2_EXTENT Extent;
 
-    Extent = (PEXT2_EXTENT)ExAllocateFromNPagedLookasideList(
+    Extent = (PEXT2_EXTENT)ExAllocateFromLookasideListEx(
                  &(Ext2Global->Ext2ExtLookasideList));
     if (!Extent) {
         return NULL;
@@ -502,7 +502,7 @@ VOID
 Ext2FreeExtent (IN PEXT2_EXTENT Extent)
 {
     ASSERT(Extent != NULL);
-    ExFreeToNPagedLookasideList(&(Ext2Global->Ext2ExtLookasideList), Extent);
+    ExFreeToLookasideListEx(&(Ext2Global->Ext2ExtLookasideList), Extent);
     DEC_MEM_COUNT(PS_EXTENT, Extent, sizeof(EXT2_EXTENT));
 }
 
@@ -1430,7 +1430,7 @@ Ext2AllocateMcb (
     }
 
     /* allocate Mcb from LookasideList */
-    Mcb = (PEXT2_MCB) (ExAllocateFromNPagedLookasideList(
+    Mcb = (PEXT2_MCB) (ExAllocateFromLookasideListEx(
                            &(Ext2Global->Ext2McbLookasideList)));
 
     if (Mcb == NULL) {
@@ -1515,7 +1515,7 @@ errorout:
             Ext2FreePool(Mcb->FullName.Buffer, EXT2_FNAME_MAGIC);
         }
 
-        ExFreeToNPagedLookasideList(&(Ext2Global->Ext2McbLookasideList), Mcb);
+        ExFreeToLookasideListEx(&(Ext2Global->Ext2McbLookasideList), Mcb);
     }
 
     return NULL;
@@ -1574,7 +1574,7 @@ Ext2FreeMcb (IN PEXT2_VCB Vcb, IN PEXT2_MCB Mcb)
     Mcb->Identifier.Type = 0;
     Mcb->Identifier.Size = 0;
 
-    ExFreeToNPagedLookasideList(&(Ext2Global->Ext2McbLookasideList), Mcb);
+    ExFreeToLookasideListEx(&(Ext2Global->Ext2McbLookasideList), Mcb);
     DEC_MEM_COUNT(PS_MCB, Mcb, sizeof(EXT2_MCB));
 }
 
@@ -2375,8 +2375,8 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         }
 
         /* initialize inode lookaside list */
-        ExInitializeNPagedLookasideList(&(Vcb->InodeLookasideList),
-                                        NULL, NULL, 0, Vcb->InodeSize,
+        ExInitializeLookasideListEx(&(Vcb->InodeLookasideList),
+                                        NULL, NULL, NonPagedPool, 0, Vcb->InodeSize,
                                         'SNIE', 0);
 
         InodeLookasideInitialized = TRUE;
@@ -2655,6 +2655,8 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
             if (IsFlagOn(Vcb->Flags, VCB_JOURNAL_RECOVER)) {
                 SetLongFlag(Vcb->Flags, VCB_READ_ONLY);
             }
+            /* finish unfinished deletes left in the orphan list */
+            Ext2ProcessOrphanList(IrpContext, Vcb);
         }
 
         /* Now allocating the mcb for root ... */
@@ -2722,7 +2724,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
             }
 
             if (InodeLookasideInitialized) {
-                ExDeleteNPagedLookasideList(&(Vcb->InodeLookasideList));
+                ExDeleteLookasideListEx(&(Vcb->InodeLookasideList));
             }
 
             if (ExtentsInitialized) {
@@ -2807,6 +2809,20 @@ Ext2DestroyVcb (IN PEXT2_VCB Vcb)
 
     Ext2CleanupAllMcbs(Vcb);
 
+    if (Vcb->sbi.s_journal) {
+        journal_t *journal = Vcb->sbi.s_journal;
+        PEXT2_MCB  jcb = (PEXT2_MCB)Vcb->sbi.s_journal_mcb;
+
+        Vcb->sbi.s_journal = NULL;
+        Vcb->sbi.s_journal_mcb = NULL;
+
+        journal->j_inode = NULL;
+        jbd2_journal_destroy(journal);
+
+        if (jcb)
+            Ext2FreeMcb(Vcb, jcb);
+    }
+
     Ext2DropBH(Vcb);
 
     if (Vcb->bd.bd_bh_cache)
@@ -2828,7 +2844,7 @@ Ext2DestroyVcb (IN PEXT2_VCB Vcb)
 
     ObDereferenceObject(Vcb->TargetDeviceObject);
 
-    ExDeleteNPagedLookasideList(&(Vcb->InodeLookasideList));
+    ExDeleteLookasideListEx(&(Vcb->InodeLookasideList));
     ExDeleteResourceLite(&Vcb->FcbLock);
     ExDeleteResourceLite(&Vcb->McbLock);
     ExDeleteResourceLite(&Vcb->MetaInode);

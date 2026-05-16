@@ -1,71 +1,514 @@
 #include "ext2fs.h"
 #include "linux\ext4.h"
+#include <linux/jbd2.h>
+
+#define EXT4_NOJOURNAL_MAX_REF_COUNT ((unsigned long) 4096)
+
+static inline int ext4_handle_valid(handle_t *handle)
+{
+    if ((ULONG_PTR)handle < EXT4_NOJOURNAL_MAX_REF_COUNT)
+        return 0;
+    return 1;
+}
+
+#define MAX_HANDLE_BUFFERS   256
+
+#define MAX_HANDLE_REVOKES   256
+
+struct ext4_handle {
+    handle_t            h;
+    int                 nbuffers;
+    struct buffer_head  *buffers[MAX_HANDLE_BUFFERS];
+    journal_t           *journal;
+    struct super_block  *sb;
+    int                 nrevoked;
+    __u64               revoked[MAX_HANDLE_REVOKES];
+};
 
 static handle_t no_journal;
 
-handle_t *__ext4_journal_start_sb(void *icb, struct super_block *sb, unsigned int line,
-				  int type, int blocks, int rsv_blocks)
+static struct ext4_handle *to_eh(handle_t *handle)
 {
-	return &no_journal;
+    return (struct ext4_handle *)((char *)handle - FIELD_OFFSET(struct ext4_handle, h));
+}
+
+static int journal_wait_for_writes(struct buffer_head **bufs, int nbufs)
+{
+    int i;
+    int err = 0;
+
+    for (i = 0; i < nbufs; i++) {
+        wait_on_buffer(bufs[i]);
+        if (buffer_write_io_error(bufs[i])) {
+            clear_buffer_write_io_error(bufs[i]);
+            err = -EIO;
+        }
+        brelse(bufs[i]);
+    }
+
+    return err;
+}
+
+/*
+ * Minimal NT-native journal commit: write dirty buffers to journal,
+ * wait for I/O, then write to home locations.
+ *
+ * Journal layout per transaction (standard JBD2 format):
+ *   [descriptor] [data block 0] [data block 1] ... [commit block]
+ *
+ * Descriptor block contains block tags mapping data blocks to home locations.
+ * Data blocks contain copies of modified metadata buffers.
+ * Commit block marks the transaction as complete.
+ *
+ * After commit block is on disk, the data is crash-safe.
+ */
+static int journal_commit_sync(struct ext4_handle *eh)
+{
+    journal_t                  *journal = eh->journal;
+    int                        blocksize = journal->j_blocksize;
+    unsigned long              head, first, last;
+    unsigned long              transaction_start;
+    int                        i, err = 0;
+    unsigned long long         desc_phys, commit_phys;
+    unsigned long long         data_phys[MAX_HANDLE_BUFFERS];
+    unsigned long long         revoke_phys[8];
+    struct buffer_head         *jbh;
+    struct buffer_head         *wbufs[MAX_HANDLE_BUFFERS + 16]; /* desc + data + revoke + commit */
+    int                        nwbufs = 0;
+    int                        nblocks;
+    int                        nrev_blocks = 0;
+    int                        revoke_entry_sz;
+    int                        revoke_per_block;
+    struct buffer_head         *home_bufs[MAX_HANDLE_BUFFERS];
+    int                        nhome = 0;
+
+    if (eh->nbuffers == 0 && eh->nrevoked == 0)
+        return 0;
+
+    revoke_entry_sz = jbd2_has_feature_64bit(journal) ? 8 : 4;
+    revoke_per_block = (blocksize - sizeof(jbd2_journal_revoke_header_t)) / revoke_entry_sz;
+    if (eh->nrevoked > 0) {
+        nrev_blocks = (eh->nrevoked + revoke_per_block - 1) / revoke_per_block;
+        if (nrev_blocks > (int)(sizeof(revoke_phys)/sizeof(revoke_phys[0]))) {
+            return -ENOSPC;
+        }
+    }
+
+    mutex_lock(&journal->j_checkpoint_mutex);
+
+    head = journal->j_head;
+    transaction_start = head;
+    first = journal->j_first;
+    last = journal->j_last;
+    nblocks = 1 + eh->nbuffers + nrev_blocks + 1; /* descriptor + data + revoke + commit */
+    if (nblocks > (int)(journal->j_free)) {
+        mutex_unlock(&journal->j_checkpoint_mutex);
+        return -ENOSPC;
+    }
+
+    /* --- Phase 0: Pre-compute all logical → physical mappings --- */
+
+    /* descriptor block bmap */
+    {
+        unsigned long logical_block = head;
+
+        head++;
+        if (head == last)
+            head = first;
+
+        err = jbd2_journal_bmap(journal, logical_block, &desc_phys);
+        if (err)
+            goto out_release;
+    }
+
+    for (i = 0; i < eh->nbuffers; i++) {
+        unsigned long logical_block = head;
+
+        head++;
+        if (head == last)
+            head = first;
+
+        err = jbd2_journal_bmap(journal, logical_block, &data_phys[i]);
+        if (err)
+            goto out_release;
+    }
+
+    /* revoke descriptor block bmap(s) */
+    for (i = 0; i < nrev_blocks; i++) {
+        unsigned long logical_block = head;
+
+        head++;
+        if (head == last)
+            head = first;
+
+        err = jbd2_journal_bmap(journal, logical_block, &revoke_phys[i]);
+        if (err)
+            goto out_release;
+    }
+
+    /* commit block bmap */
+    {
+        unsigned long logical_block = head;
+
+        head++;
+        if (head == last)
+            head = first;
+
+        err = jbd2_journal_bmap(journal, logical_block, &commit_phys);
+        if (err)
+            goto out_release;
+    }
+
+    /* --- Phase 1: Write descriptor block (standard JBD2: descriptor first) --- */
+
+    {
+        journal_header_t *header;
+        char *tag_ptr;
+
+        jbh = sb_getblk_zero(eh->sb, (sector_t)desc_phys);
+        if (!jbh) {
+            err = -ENOMEM;
+            goto out_release;
+        }
+
+        header = (journal_header_t *)jbh->b_data;
+        header->h_magic = cpu_to_be32(JBD2_MAGIC_NUMBER);
+        header->h_blocktype = cpu_to_be32(JBD2_DESCRIPTOR_BLOCK);
+        header->h_sequence = cpu_to_be32(journal->j_transaction_sequence);
+
+        tag_ptr = jbh->b_data + sizeof(journal_header_t);
+
+        for (i = 0; i < eh->nbuffers; i++) {
+            struct buffer_head *bh = eh->buffers[i];
+            journal_block_tag_t *tag = (journal_block_tag_t *)tag_ptr;
+
+            tag->t_blocknr = cpu_to_be32((__u32)(bh->b_blocknr & 0xFFFFFFFF));
+            tag->t_flags = cpu_to_be16((i == eh->nbuffers - 1) ? JBD2_FLAG_LAST_TAG : 0);
+            tag->t_blocknr_high = cpu_to_be32((__u32)(bh->b_blocknr >> 32));
+            tag->t_checksum = 0;
+
+            tag_ptr += sizeof(journal_block_tag_t);
+        }
+
+        set_buffer_dirty(jbh);
+        mark_buffer_dirty(jbh);
+        set_buffer_uptodate(jbh);
+        err = submit_bh(WRITE, jbh);
+        wbufs[nwbufs++] = jbh;
+        if (err)
+            goto out_wait_journal;
+    }
+
+    /* --- Phase 2: Write data copies to journal (standard JBD2: after descriptor) --- */
+
+    for (i = 0; i < eh->nbuffers; i++) {
+        struct buffer_head *bh = eh->buffers[i];
+
+        jbh = sb_getblk_zero(eh->sb, (sector_t)data_phys[i]);
+        if (!jbh) {
+            err = -ENOMEM;
+            goto out_release;
+        }
+
+        memcpy(jbh->b_data, bh->b_data, blocksize);
+        set_buffer_dirty(jbh);
+        mark_buffer_dirty(jbh);
+        set_buffer_uptodate(jbh);
+        err = submit_bh(WRITE, jbh);
+        wbufs[nwbufs++] = jbh;
+        if (err)
+            goto out_wait_journal;
+
+        home_bufs[nhome++] = bh;
+    }
+
+    /* --- Phase 2.5: Write revoke descriptor block(s) --- */
+
+    if (nrev_blocks > 0) {
+        int rev_idx = 0;
+        int b;
+
+        for (b = 0; b < nrev_blocks; b++) {
+            jbd2_journal_revoke_header_t *rhdr;
+            char *p;
+            int n_this;
+            int k;
+
+            jbh = sb_getblk_zero(eh->sb, (sector_t)revoke_phys[b]);
+            if (!jbh) {
+                err = -ENOMEM;
+                goto out_wait_journal;
+            }
+
+            rhdr = (jbd2_journal_revoke_header_t *)jbh->b_data;
+            rhdr->r_header.h_magic = cpu_to_be32(JBD2_MAGIC_NUMBER);
+            rhdr->r_header.h_blocktype = cpu_to_be32(JBD2_REVOKE_BLOCK);
+            rhdr->r_header.h_sequence = cpu_to_be32(journal->j_transaction_sequence);
+
+            p = jbh->b_data + sizeof(jbd2_journal_revoke_header_t);
+            n_this = eh->nrevoked - rev_idx;
+            if (n_this > revoke_per_block)
+                n_this = revoke_per_block;
+
+            for (k = 0; k < n_this; k++) {
+                if (revoke_entry_sz == 8) {
+                    *((__be64 *)p) = cpu_to_be64(eh->revoked[rev_idx + k]);
+                    p += 8;
+                } else {
+                    *((__be32 *)p) = cpu_to_be32((__u32)eh->revoked[rev_idx + k]);
+                    p += 4;
+                }
+            }
+            rev_idx += n_this;
+
+            rhdr->r_count = cpu_to_be32(sizeof(jbd2_journal_revoke_header_t) +
+                                        n_this * revoke_entry_sz);
+
+            set_buffer_dirty(jbh);
+            mark_buffer_dirty(jbh);
+            set_buffer_uptodate(jbh);
+            err = submit_bh(WRITE, jbh);
+            wbufs[nwbufs++] = jbh;
+            if (err)
+                goto out_wait_journal;
+        }
+    }
+
+    err = journal_wait_for_writes(wbufs, nwbufs);
+    nwbufs = 0;
+    if (err)
+        goto out_release;
+
+    /* Make committed transaction discoverable before commit/home writes. */
+    err = jbd2_journal_update_sb_log_tail(journal,
+                                          journal->j_transaction_sequence,
+                                          transaction_start,
+                                          0);
+    if (err)
+        goto out_release;
+
+    /* --- Phase 3: Write commit block --- */
+
+    {
+        struct commit_header *commit;
+        LARGE_INTEGER li;
+
+        jbh = sb_getblk_zero(eh->sb, (sector_t)commit_phys);
+        if (!jbh) {
+            err = -ENOMEM;
+            goto out_release;
+        }
+
+        commit = (struct commit_header *)jbh->b_data;
+        commit->h_magic = cpu_to_be32(JBD2_MAGIC_NUMBER);
+        commit->h_blocktype = cpu_to_be32(JBD2_COMMIT_BLOCK);
+        commit->h_sequence = cpu_to_be32(journal->j_transaction_sequence);
+        commit->h_chksum_type = 0;
+        commit->h_chksum_size = 0;
+        RtlZeroMemory(commit->h_padding, sizeof(commit->h_padding));
+        RtlZeroMemory(commit->h_chksum, sizeof(commit->h_chksum));
+
+        KeQuerySystemTimePrecise(&li);
+        commit->h_commit_sec = cpu_to_be64((__u64)(li.QuadPart / 10000000));
+        commit->h_commit_nsec = cpu_to_be32((__u32)((li.QuadPart % 10000000) * 100));
+
+        set_buffer_dirty(jbh);
+        mark_buffer_dirty(jbh);
+        set_buffer_uptodate(jbh);
+        err = submit_bh(WRITE, jbh);
+        wbufs[nwbufs++] = jbh;
+        if (err)
+            goto out_wait_journal;
+    }
+
+    /* --- Phase 4: Wait for commit I/O --- */
+
+    err = journal_wait_for_writes(wbufs, nwbufs);
+    nwbufs = 0;
+    if (err)
+        goto out_release;
+
+    /* --- Phase 5: Update journal head in memory --- */
+
+    journal->j_head = head;
+    journal->j_free -= nblocks;
+    journal->j_transaction_sequence++;
+
+    /* --- Phase 6: Write originals to home locations --- */
+
+    for (i = 0; i < nhome; i++) {
+        err = sync_dirty_buffer(home_bufs[i]);
+        if (err)
+            goto out_release;
+    }
+
+    err = jbd2_journal_update_sb_log_tail(journal,
+                                          journal->j_transaction_sequence,
+                                          journal->j_head,
+                                          0);
+    if (!err) {
+        /* All home writes flushed → entire committed range is checkpointed.
+         * Reclaim journal log space: advance tail to head, restore j_free. */
+        unsigned long freed = journal->j_head - journal->j_tail;
+        if (journal->j_head < journal->j_tail)
+            freed += journal->j_last - journal->j_first;
+        journal->j_free += freed;
+        journal->j_tail = journal->j_head;
+        journal->j_tail_sequence = journal->j_transaction_sequence;
+        journal->j_flags |= JBD2_FLUSHED;
+    }
+
+    goto out_release;
+
+out_wait_journal:
+    if (nwbufs)
+        journal_wait_for_writes(wbufs, nwbufs);
+
+out_release:
+    mutex_unlock(&journal->j_checkpoint_mutex);
+    return err;
+}
+
+/* ==================== Public API ==================== */
+
+handle_t *__ext4_journal_start_sb(void *icb, struct super_block *sb, unsigned int line,
+                  int type, int blocks, int rsv_blocks)
+{
+    journal_t *journal;
+    struct ext4_handle *eh;
+
+    if (!sb) return &no_journal;
+
+    journal = EXT4_SB(sb)->s_journal;
+    if (!journal) return &no_journal;
+
+    eh = (struct ext4_handle *)kmalloc(sizeof(*eh), GFP_KERNEL);
+    if (!eh) {
+        return (handle_t *)ERR_PTR(-ENOMEM);
+    }
+
+    RtlZeroMemory(eh, sizeof(*eh));
+    eh->h.h_buffer_credits = blocks;
+    eh->h.h_ref = 1;
+    eh->journal = journal;
+    eh->sb = sb;
+    eh->nbuffers = 0;
+
+    /* Mark handle as valid: set h_transaction to non-NULL non-small value */
+    eh->h.h_transaction = (transaction_t *)((ULONG_PTR)1);
+
+    return &eh->h;
 }
 
 int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_t *handle)
 {
-	return 0;
+    struct ext4_handle *eh;
+    int err = 0;
+
+    if (!ext4_handle_valid(handle))
+        return 0;
+
+    eh = to_eh(handle);
+    eh->h.h_ref--;
+
+    if (eh->h.h_ref > 0)
+        return 0;
+
+    if (eh->nbuffers > 0) {
+        err = journal_commit_sync(eh);
+    }
+
+    kfree(eh);
+    return err;
 }
 
 void ext4_journal_abort_handle(const char *caller, unsigned int line,
-			       const char *err_fn, struct buffer_head *bh,
-			       handle_t *handle, int err)
+                   const char *err_fn, struct buffer_head *bh,
+                   handle_t *handle, int err)
 {
 }
 
 int __ext4_journal_get_write_access(const char *where, unsigned int line,
-				    void *icb, handle_t *handle, struct buffer_head *bh)
+                    void *icb, handle_t *handle, struct buffer_head *bh)
 {
-	int err = 0;
-	return err;
+    if (!ext4_handle_valid(handle))
+        return 0;
+    return 0;
 }
 
-/*
- * The ext4 forget function must perform a revoke if we are freeing data
- * which has been journaled.  Metadata (eg. indirect blocks) must be
- * revoked in all cases.
- *
- * "bh" may be NULL: a metadata block may have been freed from memory
- * but there may still be a record of it in the journal, and that record
- * still needs to be revoked.
- *
- * If the handle isn't valid we're not journaling, but we still need to
- * call into ext4_journal_revoke() to put the buffer head.
- */
 int __ext4_forget(const char *where, unsigned int line, void *icb, handle_t *handle,
-		  int is_metadata, struct inode *inode,
-		  struct buffer_head *bh, ext4_fsblk_t blocknr)
+          int is_metadata, struct inode *inode,
+          struct buffer_head *bh, ext4_fsblk_t blocknr)
 {
-	int err = 0;
-	return err;
+    return 0;
 }
 
 int __ext4_journal_get_create_access(const char *where, unsigned int line,
-				void *icb, handle_t *handle, struct buffer_head *bh)
+                void *icb, handle_t *handle, struct buffer_head *bh)
 {
-	int err = 0;
-	return err;
+    if (!ext4_handle_valid(handle))
+        return 0;
+    return 0;
 }
 
 int __ext4_handle_dirty_metadata(const char *where, unsigned int line,
-				 void *icb, handle_t *handle, struct inode *inode,
-				 struct buffer_head *bh)
+                 void *icb, handle_t *handle, struct inode *inode,
+                 struct buffer_head *bh)
 {
-	int err = 0;
+    struct ext4_handle *eh;
+    int i;
 
-	extents_mark_buffer_dirty(bh);
-	return err;
+    if (!ext4_handle_valid(handle)) {
+        extents_mark_buffer_dirty(bh);
+        return 0;
+    }
+
+    eh = to_eh(handle);
+
+    /* Deduplicate: check if already tracked */
+    for (i = 0; i < eh->nbuffers; i++) {
+        if (eh->buffers[i] == bh) {
+            extents_mark_buffer_dirty(bh);
+            return 0;
+        }
+    }
+
+    if (eh->nbuffers >= MAX_HANDLE_BUFFERS) {
+        printk(KERN_ERR "Ext4Fsd: handle buffer overflow at %s:%d\n", where, line);
+        return -ENOSPC;
+    }
+
+    eh->buffers[eh->nbuffers++] = bh;
+    extents_mark_buffer_dirty(bh);
+    return 0;
 }
 
 int __ext4_handle_dirty_super(const char *where, unsigned int line,
-			      handle_t *handle, struct super_block *sb)
+                  handle_t *handle, struct super_block *sb)
 {
+    return 0;
+}
+
+int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
+{
+    struct ext4_handle *eh;
+    int i;
+
+    if (!ext4_handle_valid(handle))
+        return 0;
+
+    eh = to_eh(handle);
+
+    for (i = 0; i < eh->nrevoked; i++) {
+        if (eh->revoked[i] == (__u64)blocknr)
+            return 0;
+    }
+
+    if (eh->nrevoked >= MAX_HANDLE_REVOKES) {
+        printk(KERN_ERR "Ext4Fsd: handle revoke overflow\n");
+        return -ENOSPC;
+    }
+
+    eh->revoked[eh->nrevoked++] = (__u64)blocknr;
     return 0;
 }

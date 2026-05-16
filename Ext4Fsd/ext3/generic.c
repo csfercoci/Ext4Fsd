@@ -11,12 +11,36 @@
 
 #include "ext2fs.h"
 #include "linux\ext4.h"
+#include <linux/jbd2.h>
+#include "linux/ext4_jbd2.h"
 
 /* GLOBALS ***************************************************************/
 
 extern PEXT2_GLOBAL Ext2Global;
 
 /* DEFINITIONS *************************************************************/
+
+/*
+ * Ext2DirtyMetadata - mark a metadata buffer dirty.
+ *
+ * If the IRP context owns an active JBD2 transaction handle, register the
+ * buffer with that handle so it is written via the journal on commit.
+ * Otherwise fall back to the legacy direct mark_buffer_dirty path.
+ *
+ * The buffer is logically owned by the caller; the helper does not change
+ * its refcount or release it.
+ */
+static inline void
+Ext2DirtyMetadata(PEXT2_IRP_CONTEXT IrpContext, PEXT2_VCB Vcb,
+                  struct buffer_head *bh)
+{
+    if (IrpContext && IrpContext->Handle) {
+        ext4_handle_dirty_metadata((handle_t *)IrpContext->Handle,
+                                   IrpContext, NULL, bh);
+    } else {
+        mark_buffer_dirty(bh);
+    }
+}
 
 /* FUNCTIONS ***************************************************************/
 
@@ -364,7 +388,6 @@ Ext2FlushVcb(IN PEXT2_VCB Vcb)
         o = Vcb->PartitionInformation.PartitionLength;
         Ext2FlushRange(Vcb, s, o);
 
-        /* flush dirty buffer_heads before releasing locks */
         node = rb_first(&Vcb->bd.bd_bh_root);
         while (node) {
             bh = container_of(node, struct buffer_head, b_rb_node);
@@ -400,7 +423,7 @@ Ext2SaveGroup(
         return 0;
 
     ext4_group_desc_csum_set(&Vcb->sb, Group, gd);
-    mark_buffer_dirty(gb);
+    Ext2DirtyMetadata(IrpContext, Vcb, gb);
     fini_bh(&gb);
 
     return TRUE;
@@ -760,7 +783,7 @@ Ext2SaveBlock ( IN PEXT2_IRP_CONTEXT    IrpContext,
         }
 
         RtlCopyMemory(bh->b_data, Buf, BLOCK_SIZE);
-        mark_buffer_dirty(bh);
+        Ext2DirtyMetadata(IrpContext, Vcb, bh);
         rc = TRUE;
 
     } __finally {
@@ -882,7 +905,7 @@ Ext2ZeroBuffer( IN PEXT2_IRP_CONTEXT    IrpContext,
                 } else {
                     RtlZeroMemory(bh->b_data + delta, len);
                 }
-                mark_buffer_dirty(bh);
+                Ext2DirtyMetadata(IrpContext, Vcb, bh);
             } __finally {
                 fini_bh(&bh);
             }
@@ -948,7 +971,7 @@ Ext2SaveBuffer( IN PEXT2_IRP_CONTEXT    IrpContext,
 
             __try {
                 RtlCopyMemory(bh->b_data + delta, buf, len);
-                mark_buffer_dirty(bh);
+                Ext2DirtyMetadata(IrpContext, Vcb, bh);
             } __finally {
                 fini_bh(&bh);
             }
@@ -1307,6 +1330,15 @@ Again:
         BitmapBcb = NULL;
         BitmapCache = NULL;
         Ext2SaveGroup(IrpContext, Vcb, Group);
+
+        /* record revoke for each freed block so log replay does not
+         * resurrect stale metadata onto the now-reusable blocks. */
+        if (IrpContext && IrpContext->Handle) {
+            ULONG k;
+            for (k = 0; k < Count; k++) {
+                Ext2JournalRevokeBlock(IrpContext, (ULONGLONG)(Block + k));
+            }
+        }
 
         /* remove dirty MCB to prevent Volume's lazy writing. */
         if (Ext2RemoveBlockExtent(Vcb, NULL, Block, Count)) {

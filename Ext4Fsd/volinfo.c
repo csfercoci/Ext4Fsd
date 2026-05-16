@@ -173,8 +173,31 @@ Ext2QueryVolumeInformation (IN PEXT2_IRP_CONTEXT IrpContext)
         {
             PFILE_FS_ATTRIBUTE_INFORMATION  FsAttrInfo;
             ULONG                           RequiredLength;
+            PWSTR                           FileSystemName;
+            ULONG                           NameLength;
 
             if (Length < sizeof(FILE_FS_ATTRIBUTE_INFORMATION)) {
+                Status = STATUS_BUFFER_OVERFLOW;
+                __leave;
+            }
+
+            if (IsFlagOn(SUPER_BLOCK->s_feature_incompat, EXT4_FEATURE_INCOMPAT_EXTENTS)) {
+                FileSystemName = L"EXT4";
+                NameLength = 8;
+            } else if (Vcb->IsExt3fs) {
+                FileSystemName = L"EXT3";
+                NameLength = 8;
+            } else {
+                FileSystemName = L"EXT2";
+                NameLength = 8;
+            }
+
+            RequiredLength = sizeof(FILE_FS_ATTRIBUTE_INFORMATION) +
+                             NameLength - sizeof(WCHAR);
+
+            if (Length < RequiredLength) {
+                Irp->IoStatus.Information =
+                    sizeof(FILE_FS_ATTRIBUTE_INFORMATION);
                 Status = STATUS_BUFFER_OVERFLOW;
                 __leave;
             }
@@ -188,25 +211,9 @@ Ext2QueryVolumeInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                 FsAttrInfo->FileSystemAttributes |= FILE_READ_ONLY_VOLUME;
             }
             FsAttrInfo->MaximumComponentNameLength = EXT2_NAME_LEN;
-            FsAttrInfo->FileSystemNameLength = 8;
+            FsAttrInfo->FileSystemNameLength = NameLength;
 
-            RequiredLength = sizeof(FILE_FS_ATTRIBUTE_INFORMATION) +
-                             8 - sizeof(WCHAR);
-
-            if (Length < RequiredLength) {
-                Irp->IoStatus.Information =
-                    sizeof(FILE_FS_ATTRIBUTE_INFORMATION);
-                Status = STATUS_BUFFER_OVERFLOW;
-                __leave;
-            }
-
-            if (IsFlagOn(SUPER_BLOCK->s_feature_incompat, EXT4_FEATURE_INCOMPAT_EXTENTS)) {
-                RtlCopyMemory(FsAttrInfo->FileSystemName,  L"EXT4\0", 10);
-            } else if (Vcb->IsExt3fs) {
-                RtlCopyMemory(FsAttrInfo->FileSystemName,  L"EXT3\0", 10);
-            } else {
-                RtlCopyMemory(FsAttrInfo->FileSystemName,  L"EXT2\0", 10);
-            }
+            RtlCopyMemory(FsAttrInfo->FileSystemName, FileSystemName, NameLength);
 
             Irp->IoStatus.Information = RequiredLength;
             Status = STATUS_SUCCESS;
@@ -261,7 +268,9 @@ Ext2QueryVolumeInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
         if (!IrpContext->ExceptionInProgress) {
             if (Status == STATUS_PENDING) {
-                Ext2QueueRequest(IrpContext);
+                if (!NT_SUCCESS(Ext2QueueRequest(IrpContext))) {
+                    Ext2CompleteIrpContext(IrpContext, STATUS_INSUFFICIENT_RESOURCES);
+                }
             } else {
                 Ext2CompleteIrpContext(IrpContext, Status);
             }
@@ -380,7 +389,9 @@ Ext2SetVolumeInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
         if (!IrpContext->ExceptionInProgress) {
             if (Status == STATUS_PENDING) {
-                Ext2QueueRequest(IrpContext);
+                if (!NT_SUCCESS(Ext2QueueRequest(IrpContext))) {
+                    Ext2CompleteIrpContext(IrpContext, STATUS_INSUFFICIENT_RESOURCES);
+                }
             } else {
                 Ext2CompleteIrpContext(IrpContext, Status);
             }

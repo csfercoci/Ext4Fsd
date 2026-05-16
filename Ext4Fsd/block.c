@@ -187,7 +187,10 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
         if (!NT_SUCCESS(Irp->IoStatus.Status)) {
             pContext->MasterIrp->IoStatus = Irp->IoStatus;
         }
-        IoFreeMdl(Irp->MdlAddress);
+        if (Irp->MdlAddress != NULL) {
+            IoFreeMdl(Irp->MdlAddress);
+            Irp->MdlAddress = NULL;
+        }
         IoFreeIrp(Irp);
     }
 
@@ -288,9 +291,18 @@ Ext2ReadWriteBlocks(
         }
 
 
-        if (NULL == Chain->Next && 0 == Chain->Offset) {
+        if (NULL == Chain->Next && 0 == Chain->Offset && Ext2CanIWait()) {
 
-            /* we get only 1 extent to dispatch, then don't bother allocating new irps */
+            /*
+             * Single-extent SYNC path: safe to reuse MasterIrp because the sync
+             * completion routine returns STATUS_MORE_PROCESSING_REQUIRED, which
+             * stops the I/O Manager from issuing a second IoCompleteRequest.
+             *
+             * For ASYNC single-extent path we MUST allocate a separate IRP
+             * (handled in the else branch below) to avoid the storport DPC
+             * racing with our completion path and triggering bugcheck 0x44
+             * (MULTIPLE_IRP_COMPLETE_REQUESTS).
+             */
 
             /* setup the Stack location to do a read from the disk driver. */
             IrpSp = IoGetNextIrpStackLocation(MasterIrp);
@@ -339,6 +351,7 @@ Ext2ReadWriteBlocks(
                                      Irp );
 
                 if (!Mdl)  {
+                    IoFreeIrp(Irp);
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     __leave;
                 }
