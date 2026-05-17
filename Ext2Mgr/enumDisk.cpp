@@ -1739,8 +1739,13 @@ Ext2CdromInformation(PEXT2_CDROM cdrom)
         } else {
             ret += "    File system: ";
             if (cdrom->EVP.bExt2) {
-                s = "EXT";
-                s += (CHAR)('2' + cdrom->EVP.bExt3);
+                if (cdrom->EVP.bExt4) {
+                    s = "EXT4";
+                } else if (cdrom->EVP.bExt3) {
+                    s = "EXT3";
+                } else {
+                    s = "EXT2";
+                }
             } else {
                 s = "CDFS";
             }
@@ -2157,9 +2162,12 @@ Ext2QueryVolumeFS(
         volume->FsaInfo.FileSystemName[1] = (WCHAR)'X';
         volume->FsaInfo.FileSystemName[2] = (WCHAR)'T';
 
-        if (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) {
+        if ((sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) ||
+            (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) ||
+            (sb->s_feature_incompat & EXT4_FEATURE_INCOMPAT_FLEX_BG)) {
             volume->FsaInfo.FileSystemName[3] = (WCHAR)'4';
-            volume->EVP.bExt3 = TRUE;
+            volume->EVP.bExt4 = TRUE;
+            volume->EVP.bExt3 = (sb->s_feature_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) != 0;
             // Add a "+" after the filesystem name, e.g "EXT4+", if the ondisk filesystem
             // contains features not yet supported by the Windows driver.
             if (sb->s_feature_incompat & ~EXT4_FEATURE_INCOMPAT_SUPP) {
@@ -2541,7 +2549,7 @@ Ext2SetDefaultVolumeRegistryProperty(PEXT2_VOLUME_PROPERTY3 EVP)
             (BOOL *)&AutoMount
             );
 
-    if (EVP->bExt3 && !EVP->bExt3Writable)
+    if (EVP->bExt3 && !EVP->bExt4 && !EVP->bExt3Writable)
         EVP->bReadonly = TRUE;
 
     EVP->DrvLetter = 0x80;

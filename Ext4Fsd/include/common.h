@@ -167,6 +167,8 @@ typedef struct _EXT2_VOLUME_PROPERTY {
     BOOLEAN             bExt3Writable;
     BOOLEAN             bExt2;
     BOOLEAN             bExt3;
+    BOOLEAN             bExt4;
+    BOOLEAN             bReserved;
     CHAR                Codepage[CODEPAGE_MAXLEN];
 } EXT2_VOLUME_PROPERTY, *PEXT2_VOLUME_PROPERTY;
 

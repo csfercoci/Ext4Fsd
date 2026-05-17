@@ -2160,13 +2160,18 @@ Ext2PerformRegistryVolumeParams(IN PEXT2_VCB Vcb)
 
         /* set Vcb settings from Ext2Global */
         if (IsFlagOn(Ext2Global->Flags, EXT2_SUPPORT_WRITING)) {
-            if (Vcb->IsExt3fs) {
+            if (Vcb->IsExt4fs) {
+                /* ext4: writable by default (we implement journaling) */
+                ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
+            } else if (Vcb->IsExt3fs) {
+                /* ext3: RO unless EXT3_FORCE_WRITING */
                 if (IsFlagOn(Ext2Global->Flags, EXT3_FORCE_WRITING)) {
                     ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
                 } else {
                     SetLongFlag(Vcb->Flags, VCB_READ_ONLY);
                 }
             } else {
+                /* ext2: writable */
                 ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
             }
         } else {
@@ -2307,6 +2312,13 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         /* Recognize the filesystem as Ext3fs if it supports journalling */
         if (IsFlagOn(sb->s_feature_compat, EXT4_FEATURE_COMPAT_HAS_JOURNAL)) {
             Vcb->IsExt3fs = TRUE;
+        }
+
+        /* Recognize ext4 by ext4-specific incompat features */
+        if (IsFlagOn(sb->s_feature_incompat, EXT4_FEATURE_INCOMPAT_EXTENTS) ||
+            IsFlagOn(sb->s_feature_incompat, EXT4_FEATURE_INCOMPAT_64BIT) ||
+            IsFlagOn(sb->s_feature_incompat, EXT4_FEATURE_INCOMPAT_FLEX_BG)) {
+            Vcb->IsExt4fs = TRUE;
         }
 
         /* check block size */
@@ -2649,8 +2661,8 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         }
         GroupLoaded = TRUE;
 
-        /* recovery journal since it's ext3 */
-        if (Vcb->IsExt3fs) {
+        /* recovery journal for ext3/ext4 */
+        if (Vcb->IsExt3fs || Vcb->IsExt4fs) {
             Ext2RecoverJournal(IrpContext, Vcb);
             if (IsFlagOn(Vcb->Flags, VCB_JOURNAL_RECOVER)) {
                 SetLongFlag(Vcb->Flags, VCB_READ_ONLY);

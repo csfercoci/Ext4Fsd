@@ -191,7 +191,11 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
             IoFreeMdl(Irp->MdlAddress);
             Irp->MdlAddress = NULL;
         }
-        IoFreeIrp(Irp);
+        /* Do NOT IoFreeIrp(Irp) here — the I/O Manager frees associated IRPs
+         * automatically as part of decrementing MasterIrp->AssociatedIrp.IrpCount
+         * when we return STATUS_SUCCESS.  Calling IoFreeIrp here caused a
+         * double-free that corrupted the IRP and triggered bugcheck 0x44
+         * (MULTIPLE_IRP_COMPLETE_REQUESTS) via CLASSPNP/storport. */
     }
 
     if (InterlockedDecrement(&pContext->Blocks) == 0) {
@@ -251,6 +255,7 @@ Ext2ReadWriteBlocks(
     NTSTATUS            Status = STATUS_SUCCESS;
     BOOLEAN             bMasterCompleted = FALSE;
     BOOLEAN             bBugCheck = FALSE;
+    BOOLEAN             bCanWait;
 
     ASSERT(MasterIrp);
 
@@ -266,7 +271,8 @@ Ext2ReadWriteBlocks(
 
         INC_MEM_COUNT(PS_RW_CONTEXT, pContext, sizeof(EXT2_RW_CONTEXT));
         RtlZeroMemory(pContext, sizeof(EXT2_RW_CONTEXT));
-        pContext->Wait = Ext2CanIWait();
+        bCanWait = Ext2CanIWait();
+        pContext->Wait = bCanWait;
         pContext->MasterIrp = MasterIrp;
         pContext->Length = Length;
 
@@ -291,7 +297,7 @@ Ext2ReadWriteBlocks(
         }
 
 
-        if (NULL == Chain->Next && 0 == Chain->Offset && Ext2CanIWait()) {
+        if (NULL == Chain->Next && 0 == Chain->Offset && bCanWait) {
 
             /*
              * Single-extent SYNC path: safe to reuse MasterIrp because the sync
@@ -318,9 +324,7 @@ Ext2ReadWriteBlocks(
 
             IoSetCompletionRoutine(
                     MasterIrp,
-                    Ext2CanIWait() ?
-                    Ext2ReadWriteBlockSyncCompletionRoutine :
-                    Ext2ReadWriteBlockAsyncCompletionRoutine,
+                    Ext2ReadWriteBlockSyncCompletionRoutine,
                     (PVOID) pContext,
                     TRUE,
                     TRUE,
@@ -370,7 +374,7 @@ Ext2ReadWriteBlocks(
 
                 IoSetCompletionRoutine(
                     Irp,
-                    Ext2CanIWait() ?
+                    bCanWait ?
                     Ext2ReadWriteBlockSyncCompletionRoutine :
                     Ext2ReadWriteBlockAsyncCompletionRoutine,
                     (PVOID) pContext,
@@ -399,11 +403,11 @@ Ext2ReadWriteBlocks(
             }
 
             MasterIrp->AssociatedIrp.IrpCount = pContext->Blocks;
-            if (Ext2CanIWait()) {
+            if (bCanWait) {
                 MasterIrp->AssociatedIrp.IrpCount += 1;
             }
         }
-        if (!Ext2CanIWait()) {
+        if (!bCanWait) {
             /* mark MasterIrp pending */
             IoMarkIrpPending(pContext->MasterIrp);
         }
@@ -416,7 +420,7 @@ Ext2ReadWriteBlocks(
             Extent->Irp = NULL;
         }
 
-        if (Ext2CanIWait()) {
+        if (bCanWait) {
             LARGE_INTEGER Timeout;
             Timeout.QuadPart = (LONGLONG)-30 * 10 * 1000 * 1000; /* 30 seconds */
             Status = KeWaitForSingleObject( &(pContext->Event),
@@ -452,7 +456,7 @@ Ext2ReadWriteBlocks(
 
         } else {
 
-            if (Ext2CanIWait()) {
+            if (bCanWait) {
                 if (MasterIrp) {
                     Status = MasterIrp->IoStatus.Status;
                 }

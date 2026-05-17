@@ -587,8 +587,13 @@ void CProperties::SetCdrom(PEXT2_CDROM cdrom)
             SET_TEXT(IDC_SDEV_FREE_SIZE, "0");
 
             if (cdrom->EVP.bExt2) {
-                s = "EXT";
-                s += (CHAR)('2' + cdrom->EVP.bExt3);
+                if (cdrom->EVP.bExt4) {
+                    s = "EXT4";
+                } else if (cdrom->EVP.bExt3) {
+                    s = "EXT3";
+                } else {
+                    s = "EXT2";
+                }
                 SET_WIN(IDC_SDEV_EXT2_INFO, TRUE);
             } else {
                 s = "CDFS";

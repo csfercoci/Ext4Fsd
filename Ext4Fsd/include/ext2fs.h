@@ -695,6 +695,7 @@ typedef struct _EXT2_VCB {
     PARTITION_INFORMATION       PartitionInformation;
 
     BOOLEAN                     IsExt3fs;
+    BOOLEAN                     IsExt4fs;
     PEXT2_SUPER_BLOCK           SuperBlock;
 
     // Block / Cluster size

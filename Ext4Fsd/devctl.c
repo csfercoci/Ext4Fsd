@@ -340,6 +340,26 @@ Ext2ProcessGlobalProperty(
                 }
             }
 
+            /* Update existing volumes to reflect new global flags */
+            {
+                PLIST_ENTRY ListEntry = Ext2Global->VcbList.Flink;
+                while (ListEntry != &Ext2Global->VcbList) {
+                    PEXT2_VCB Vcb = CONTAINING_RECORD(ListEntry, EXT2_VCB, Next);
+                    ListEntry = ListEntry->Flink;
+
+                    if (Vcb->IsExt3fs || Vcb->IsExt4fs) {
+                        BOOLEAN readonly = Property->bReadonly;
+                        if (Vcb->IsExt3fs && !Property->bExt3Writable)
+                            readonly = TRUE;
+                        if (readonly) {
+                            SetLongFlag(Vcb->Flags, VCB_READ_ONLY);
+                        } else {
+                            ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
+                        }
+                    }
+                }
+            }
+
             PageTable = load_nls(Property->Codepage);
             if (PageTable) {
                 memcpy(Ext2Global->Codepage.AnsiName, Property->Codepage, CODEPAGE_MAXLEN);
@@ -462,11 +482,27 @@ Ext2ProcessVolumeProperty(
                     SetLongFlag(Vcb->Flags, VCB_FORCE_WRITING);
                 }
 
-                if (!Vcb->IsExt3fs) {
+                if (Vcb->IsExt4fs) {
+                    /* ext4: always attempt journal recovery, then go RW */
+                    if (IsFlagOn(Vcb->Flags, VCB_JOURNAL_RECOVER)) {
+                        ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
+                        Ext2RecoverJournal(NULL, Vcb);
+                        if (IsFlagOn(Vcb->Flags, VCB_JOURNAL_RECOVER)) {
+                            SetLongFlag(Vcb->Flags, VCB_READ_ONLY);
+                        } else {
+                            ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
+                        }
+                    } else {
+                        ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
+                    }
+                } else if (!Vcb->IsExt3fs) {
+                    /* ext2: writable */
                     ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
                 } else if (!Property->bExt3Writable) {
+                    /* ext3: RO unless bExt3Writable */
                     SetLongFlag(Vcb->Flags, VCB_READ_ONLY);
                 } else if (IsFlagOn(Vcb->Flags, VCB_JOURNAL_RECOVER)) {
+                    /* ext3 with force write: try recovery */
                     ClearLongFlag(Vcb->Flags, VCB_READ_ONLY);
                     Ext2RecoverJournal(NULL, Vcb);
                     if (IsFlagOn(Vcb->Flags, VCB_JOURNAL_RECOVER)) {
@@ -540,8 +576,9 @@ Ext2ProcessVolumeProperty(
 
             Property->bExt2 = TRUE;
             Property->bExt3 = Vcb->IsExt3fs;
+            Property->bExt4 = Vcb->IsExt4fs;
             Property->bReadonly = IsFlagOn(Vcb->Flags, VCB_READ_ONLY);
-            if (!Property->bReadonly && Vcb->IsExt3fs) {
+            if (!Property->bReadonly && (Vcb->IsExt3fs || Vcb->IsExt4fs)) {
                 Property->bExt3Writable = TRUE;
             } else {
                 Property->bExt3Writable = FALSE;
