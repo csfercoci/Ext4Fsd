@@ -769,6 +769,7 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
 
     BOOLEAN             RecursiveWriteThrough = FALSE;
     BOOLEAN             MainResourceAcquired = FALSE;
+    BOOLEAN             MainResourceShared = FALSE;
     BOOLEAN             PagingIoResourceAcquired = FALSE;
 
     BOOLEAN             bDeferred = FALSE;
@@ -950,11 +951,23 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                 __leave;
             }
 
-            if (!ExAcquireResourceExclusiveLite(&Fcb->MainResource, TRUE)) {
-                Status = STATUS_PENDING;
-                __leave;
+            {
+                BOOLEAN willExtend = (LONGLONG)(ByteOffset.QuadPart + (LONGLONG)Length) > Fcb->Header.FileSize.QuadPart;
+
+                if (!willExtend && !Nocache) {
+                    if (!ExAcquireResourceSharedLite(&Fcb->MainResource, TRUE)) {
+                        Status = STATUS_PENDING;
+                        __leave;
+                    }
+                    MainResourceShared = TRUE;
+                } else {
+                    if (!ExAcquireResourceExclusiveLite(&Fcb->MainResource, TRUE)) {
+                        Status = STATUS_PENDING;
+                        __leave;
+                    }
+                }
+                MainResourceAcquired = TRUE;
             }
-            MainResourceAcquired = TRUE;
 
             //
             //  Do flushing for such cases
@@ -1239,10 +1252,10 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
             }
         }
 
-        if (NT_SUCCESS(Status) && IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
-            Ext2SaveInode(IrpContext, Vcb, Fcb->Inode);
-            ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
-        }
+        /*
+         * Defer inode save to flush/cleanup: leave FCB_ALLOC_IN_WRITE set
+         * so Ext2FlushFile / Ext2Cleanup can do a single batch save.
+         */
 
         if (FileSizesChanged) {
             FileObject->Flags |= FO_FILE_SIZE_CHANGED | FO_FILE_MODIFIED;

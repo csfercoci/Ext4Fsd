@@ -749,6 +749,12 @@ typedef struct _EXT2_VCB {
     struct super_block          sb;
     struct ext3_sb_info         sbi;
 
+    /* Deferred journal commit accumulator.
+     * When non-NULL, dirty metadata buffers from closed handles are
+     * merged here instead of being committed synchronously.
+     * Flushed by Ext2FlushVcb/Ext2PurgeVolume/Ext2DestroyVcb. */
+    void                        *PendingJournalHandle;
+
     /* Maximum file size in blocks ... */
     ULONG                       max_blocks_per_layer[EXT2_BLOCK_TYPES];
     ULONG                       max_data_blocks;
@@ -1791,6 +1797,11 @@ VOID
 Ext2JournalRevokeBlock(
     IN PEXT2_IRP_CONTEXT    IrpContext,
     IN ULONGLONG            BlockNr
+);
+
+VOID
+Ext2JournalFlushPending(
+    IN PEXT2_VCB            Vcb
 );
 
 NTSTATUS

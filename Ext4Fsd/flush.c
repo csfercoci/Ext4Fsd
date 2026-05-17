@@ -94,6 +94,11 @@ Ext2FlushFile (
         CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
         ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
 
+        if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
+            Ext2SaveInode(IrpContext, Fcb->Vcb, Fcb->Inode);
+            ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
+        }
+
     } __finally {
 
         /* do cleanup here */

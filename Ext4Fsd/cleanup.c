@@ -178,6 +178,14 @@ Ext2Cleanup (IN PEXT2_IRP_CONTEXT IrpContext)
                     FILE_ACTION_MODIFIED );
             }
 
+            /*
+             * Inode was deferred from write.c — save now before close.
+             */
+            if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
+                Ext2SaveInode(IrpContext, Vcb, Fcb->Inode);
+                ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
+            }
+
             FsRtlCheckOplock( &Fcb->Oplock,
                               Irp,
                               IrpContext,

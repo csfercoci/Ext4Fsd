@@ -403,7 +403,11 @@ handle_t *__ext4_journal_start_sb(void *icb, struct super_block *sb, unsigned in
 int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_t *handle)
 {
     struct ext4_handle *eh;
+    struct ext4_handle *pending;
+    PEXT2_IRP_CONTEXT IrpContext;
+    PEXT2_VCB Vcb;
     int err = 0;
+    int i, j;
 
     if (!ext4_handle_valid(handle))
         return 0;
@@ -414,10 +418,75 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
     if (eh->h.h_ref > 0)
         return 0;
 
-    if (eh->nbuffers > 0) {
-        err = journal_commit_sync(eh);
+    /* If no dirty buffers and no revokes, just free and return. */
+    if (eh->nbuffers == 0 && eh->nrevoked == 0) {
+        kfree(eh);
+        return 0;
     }
 
+    /*
+     * Try to defer: merge into VCB-level pending handle instead of
+     * committing synchronously.  The pending handle is committed in
+     * bulk at flush / unmount time.
+     */
+    IrpContext = (PEXT2_IRP_CONTEXT)icb;
+    Vcb = NULL;
+    if (IrpContext && IrpContext->DeviceObject) {
+        PDEVICE_OBJECT dev = IrpContext->DeviceObject;
+        PEXT2_VCB maybe = (PEXT2_VCB)dev->DeviceExtension;
+        if (maybe && maybe->Identifier.Type == EXT2VCB &&
+            maybe->Identifier.Size == sizeof(EXT2_VCB))
+            Vcb = maybe;
+    }
+
+    if (Vcb) {
+        journal_t *journal = eh->journal;
+
+        mutex_lock(&journal->j_checkpoint_mutex);
+        pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
+
+        if (pending == NULL) {
+            /* Become the pending handle -- don't commit yet. */
+            Vcb->PendingJournalHandle = (void *)eh;
+            mutex_unlock(&journal->j_checkpoint_mutex);
+            return 0;
+        }
+
+        if ((pending->nbuffers + eh->nbuffers) <= MAX_HANDLE_BUFFERS &&
+            (pending->nrevoked + eh->nrevoked) <= MAX_HANDLE_REVOKES) {
+
+            /* Merge buffers (deduplicated) */
+            for (i = 0; i < eh->nbuffers; i++) {
+                int dup = 0;
+                for (j = 0; j < pending->nbuffers; j++) {
+                    if (pending->buffers[j] == eh->buffers[i]) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup)
+                    pending->buffers[pending->nbuffers++] = eh->buffers[i];
+            }
+
+            /* Merge revokes */
+            for (i = 0; i < eh->nrevoked; i++)
+                pending->revoked[pending->nrevoked++] = eh->revoked[i];
+
+            mutex_unlock(&journal->j_checkpoint_mutex);
+            kfree(eh);
+            return 0;
+        }
+
+        /* Pending handle full -- commit it now, then become new pending. */
+        Vcb->PendingJournalHandle = (void *)eh;
+        mutex_unlock(&journal->j_checkpoint_mutex);
+        err = journal_commit_sync(pending);
+        kfree(pending);
+        return err;
+    }
+
+    /* No VCB context -- commit immediately (safety fallback). */
+    err = journal_commit_sync(eh);
     kfree(eh);
     return err;
 }
@@ -511,4 +580,34 @@ int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
 
     eh->revoked[eh->nrevoked++] = (__u64)blocknr;
     return 0;
+}
+
+/*
+ * Flush and free any pending deferred journal handle on this VCB.
+ * Called at explicit flush, volume purge, and VCB destroy time.
+ * Must be called while the caller holds appropriate VCB locks.
+ */
+void Ext2JournalFlushPending(PEXT2_VCB Vcb)
+{
+    struct ext4_handle *pending;
+    journal_t *journal;
+
+    if (!Vcb)
+        return;
+
+    journal = EXT4_SB(&Vcb->sb)->s_journal;
+    if (!journal)
+        return;
+
+    mutex_lock(&journal->j_checkpoint_mutex);
+    pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
+    if (pending) {
+        Vcb->PendingJournalHandle = NULL;
+    }
+    mutex_unlock(&journal->j_checkpoint_mutex);
+
+    if (pending) {
+        journal_commit_sync(pending);
+        kfree(pending);
+    }
 }
