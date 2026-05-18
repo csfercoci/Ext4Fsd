@@ -351,6 +351,9 @@ Ext2FlushVcb(IN PEXT2_VCB Vcb)
 
     ASSERT(ExIsResourceAcquiredExclusiveLite(&Vcb->MainResource));
 
+    /* Flush any deferred pending journal handle before flushing VCB. */
+    Ext2JournalFlushPending(Vcb);
+
     __try {
 
         /* acqurie gd block */
@@ -1129,8 +1132,19 @@ Again:
 
                 RtlZeroMemory(&BlockBitmap, sizeof(RTL_BITMAP));
 
-                /* no blocks found: set bg_free_blocks_count to 0 */
-                ext4_free_blks_set(sb, gd, 0);
+                /* no blocks found: repair both group and superblock counters */
+                {
+                    ext3_fsblk_t GroupFree = ext4_free_blks_count(sb, gd);
+                    ext3_fsblk_t FreeBlocks = ext3_free_blocks_count(SUPER_BLOCK);
+
+                    ext4_free_blks_set(sb, gd, 0);
+                    if (FreeBlocks > GroupFree) {
+                        ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks - GroupFree);
+                    } else {
+                        ext3_free_blocks_count_set(SUPER_BLOCK, 0);
+                    }
+                    Ext2SaveSuper(IrpContext, Vcb);
+                }
                 ext4_block_bitmap_csum_set(sb, Group, gd, bh);
                 Ext2SaveGroup(IrpContext, Vcb, Group);
 
@@ -1167,12 +1181,27 @@ Again:
         mark_buffer_dirty(bh);
 
         /* update group description */
-        ext4_free_blks_set(sb, gd, RtlNumberOfClearBits(&BlockBitmap));
+        {
+            ext3_fsblk_t OldFree = ext4_free_blks_count(sb, gd);
+            ULONG NewFree = RtlNumberOfClearBits(&BlockBitmap);
+            ext3_fsblk_t FreeBlocks = ext3_free_blocks_count(SUPER_BLOCK);
+
+            ext4_free_blks_set(sb, gd, (__u32)NewFree);
+
+            if (OldFree > NewFree) {
+                ext3_fsblk_t Delta = OldFree - NewFree;
+                if (FreeBlocks > Delta) {
+                    ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks - Delta);
+                } else {
+                    ext3_free_blocks_count_set(SUPER_BLOCK, 0);
+                }
+            } else if (NewFree > OldFree) {
+                ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks + (NewFree - OldFree));
+            }
+            Ext2SaveSuper(IrpContext, Vcb);
+        }
         ext4_block_bitmap_csum_set(sb, Group, gd, bh);
         Ext2SaveGroup(IrpContext, Vcb, Group);
-
-        /* update Vcb free blocks */
-        Ext2UpdateVcbStat(IrpContext, Vcb);
 
         /* validate the new allocated block number */
         *Block = Index + EXT2_FIRST_DATA_BLOCK + Group * BLOCKS_PER_GROUP;
@@ -1318,7 +1347,24 @@ Again:
         RtlClearBits(&BlockBitmap, Index, Count);
 
         /* update group description table */
-        ext4_free_blks_set(sb, gd, RtlNumberOfClearBits(&BlockBitmap));
+        {
+            ext3_fsblk_t OldFree = ext4_free_blks_count(sb, gd);
+            ULONG NewFree = RtlNumberOfClearBits(&BlockBitmap);
+            ext3_fsblk_t FreeBlocks = ext3_free_blocks_count(SUPER_BLOCK);
+
+            ext4_free_blks_set(sb, gd, (__u32)NewFree);
+            if (NewFree > OldFree) {
+                ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks + (NewFree - OldFree));
+            } else if (OldFree > NewFree) {
+                ext3_fsblk_t Delta = OldFree - NewFree;
+                if (FreeBlocks > Delta) {
+                    ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks - Delta);
+                } else {
+                    ext3_free_blocks_count_set(SUPER_BLOCK, 0);
+                }
+            }
+            Ext2SaveSuper(IrpContext, Vcb);
+        }
 
         bh.b_data = BitmapCache;
         ext4_block_bitmap_csum_set(sb, Group, gd, &bh);
@@ -1346,9 +1392,6 @@ Again:
             DbgBreak();
             Ext2RemoveBlockExtent(Vcb, NULL, Block, Count);
         }
-
-        /* save super block (used/unused blocks statics) */
-        Ext2UpdateVcbStat(IrpContext, Vcb);
 
         /* try next group to clear all remaining */
         Number -= Count;

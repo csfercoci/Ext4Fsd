@@ -237,6 +237,14 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
     return STATUS_SUCCESS;
 }
 
+/*
+ * Chunk size for parallel I/O submission.
+ * Splitting large contiguous extents into 256 KB pieces lets the NVMe
+ * controller keep multiple commands in flight simultaneously instead of
+ * serialising at queue-depth 1.
+ */
+#define EXT2_RW_CHUNK_SIZE  (256 * 1024)
+
 NTSTATUS
 Ext2ReadWriteBlocks(
     IN PEXT2_IRP_CONTEXT    IrpContext,
@@ -245,17 +253,20 @@ Ext2ReadWriteBlocks(
     IN ULONG                Length
     )
 {
-    PIRP                Irp;
     PIRP                MasterIrp = IrpContext->Irp;
     PIO_STACK_LOCATION  IrpSp;
     PMDL                Mdl;
     PEXT2_RW_CONTEXT    pContext = NULL;
     PEXT2_EXTENT        Extent;
-    KEVENT              Wait;
     NTSTATUS            Status = STATUS_SUCCESS;
     BOOLEAN             bMasterCompleted = FALSE;
     BOOLEAN             bBugCheck = FALSE;
     BOOLEAN             bCanWait;
+
+    PIRP               *ChunkIrps = NULL;
+    ULONG               MaxChunks = 0;
+    ULONG               nChunks = 0;
+    ULONG               i;
 
     ASSERT(MasterIrp);
 
@@ -275,6 +286,8 @@ Ext2ReadWriteBlocks(
         pContext->Wait = bCanWait;
         pContext->MasterIrp = MasterIrp;
         pContext->Length = Length;
+        MasterIrp->IoStatus.Status = STATUS_SUCCESS;
+        MasterIrp->IoStatus.Information = 0;
 
         if (IrpContext->MajorFunction == IRP_MJ_WRITE) {
             SetFlag(pContext->Flags, EXT2_RW_CONTEXT_WRITE);
@@ -296,84 +309,91 @@ Ext2ReadWriteBlocks(
             pContext->ThreadId = ExGetCurrentResourceThread();
         }
 
+        for (Extent = Chain; Extent != NULL; Extent = Extent->Next) {
+            MaxChunks += (Extent->Length + EXT2_RW_CHUNK_SIZE - 1) / EXT2_RW_CHUNK_SIZE;
+        }
 
-        if (NULL == Chain->Next && 0 == Chain->Offset && bCanWait) {
+        if (MaxChunks == 0) {
+            Status = STATUS_SUCCESS;
+            __leave;
+        }
 
-            /*
-             * Single-extent SYNC path: safe to reuse MasterIrp because the sync
-             * completion routine returns STATUS_MORE_PROCESSING_REQUIRED, which
-             * stops the I/O Manager from issuing a second IoCompleteRequest.
-             *
-             * For ASYNC single-extent path we MUST allocate a separate IRP
-             * (handled in the else branch below) to avoid the storport DPC
-             * racing with our completion path and triggering bugcheck 0x44
-             * (MULTIPLE_IRP_COMPLETE_REQUESTS).
-             */
+        ChunkIrps = Ext2AllocatePool(NonPagedPool,
+                                     sizeof(PIRP) * MaxChunks,
+                                     'RI2E');
+        if (!ChunkIrps) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            __leave;
+        }
+        RtlZeroMemory(ChunkIrps, sizeof(PIRP) * MaxChunks);
 
-            /* setup the Stack location to do a read from the disk driver. */
-            IrpSp = IoGetNextIrpStackLocation(MasterIrp);
-            IrpSp->MajorFunction = IrpContext->MajorFunction;
-            IrpSp->Parameters.Read.Length = Chain->Length;
-            IrpSp->Parameters.Read.ByteOffset.QuadPart = Chain->Lba;
-            if (IsFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WRITE_THROUGH)) {
-                SetFlag(IrpSp->Flags, SL_WRITE_THROUGH);
-            }
-            if (IsFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_VERIFY_READ)) {
-                SetFlag(IrpSp->Flags, SL_OVERRIDE_VERIFY_VOLUME);
-            }
+        /*
+         * Phase 1: build all associated IRPs for every chunk of every extent.
+         *
+         * We always use associated IRPs, even for a single contiguous extent,
+         * so that all chunks can be submitted before blocking on the event.
+         * This keeps the NVMe command queue deep instead of serialising at
+         * queue-depth 1 (the old single-IRP-then-wait approach).
+         *
+         * All IRPs are collected in ChunkIrps[].  IrpCount and pContext->Blocks
+         * are set AFTER the build loop, before any submission, to avoid the
+         * race where a fast completion fires before IrpCount is initialised.
+         */
+        for (Extent = Chain; Extent != NULL; Extent = Extent->Next) {
 
-            IoSetCompletionRoutine(
-                    MasterIrp,
-                    Ext2ReadWriteBlockSyncCompletionRoutine,
-                    (PVOID) pContext,
-                    TRUE,
-                    TRUE,
-                    TRUE );
+            ULONG   ExtentDone   = 0;
+            ULONG   ExtentRemain = Extent->Length;
 
-            /* intialize context block */
-            Chain->Irp = MasterIrp;
-            pContext->Blocks = 1;
+            while (ExtentRemain > 0) {
 
-        } else {
+                PIRP    ChunkIrp;
+                ULONG   ChunkLen    = ExtentRemain;
+                ULONG   ChunkOffset = Extent->Offset + ExtentDone;
+                LONGLONG ChunkLba   = Extent->Lba    + ExtentDone;
 
-            for (Extent = Chain; Extent != NULL; Extent = Extent->Next) {
+                if (ChunkLen > EXT2_RW_CHUNK_SIZE)
+                    ChunkLen = EXT2_RW_CHUNK_SIZE;
 
-                Irp = IoMakeAssociatedIrp(
-                          MasterIrp,
-                          (CCHAR)(Vcb->TargetDeviceObject->StackSize + 1) );
-
-                if (!Irp) {
+                if (nChunks >= MaxChunks) {
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     __leave;
                 }
 
-                Mdl = IoAllocateMdl( (PCHAR)MasterIrp->UserBuffer +
-                                     Extent->Offset,
-                                     Extent->Length,
-                                     FALSE,
-                                     FALSE,
-                                     Irp );
+                ChunkIrp = IoMakeAssociatedIrp(
+                               MasterIrp,
+                               (CCHAR)(Vcb->TargetDeviceObject->StackSize + 1) );
 
-                if (!Mdl)  {
-                    IoFreeIrp(Irp);
+                if (!ChunkIrp) {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    __leave;
+                }
+
+                Mdl = IoAllocateMdl( (PCHAR)MasterIrp->UserBuffer + ChunkOffset,
+                                     ChunkLen,
+                                     FALSE,
+                                     FALSE,
+                                     ChunkIrp );
+
+                if (!Mdl) {
+                    IoFreeIrp(ChunkIrp);
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     __leave;
                 }
 
                 IoBuildPartialMdl( MasterIrp->MdlAddress,
                                    Mdl,
-                                   (PCHAR)MasterIrp->UserBuffer+Extent->Offset,
-                                   Extent->Length );
+                                   (PCHAR)MasterIrp->UserBuffer + ChunkOffset,
+                                   ChunkLen );
 
-                IoSetNextIrpStackLocation(Irp);
-                IrpSp = IoGetCurrentIrpStackLocation(Irp);
+                IoSetNextIrpStackLocation(ChunkIrp);
+                IrpSp = IoGetCurrentIrpStackLocation(ChunkIrp);
 
                 IrpSp->MajorFunction = IrpContext->MajorFunction;
-                IrpSp->Parameters.Read.Length = Extent->Length;
-                IrpSp->Parameters.Read.ByteOffset.QuadPart = Extent->Lba;
+                IrpSp->Parameters.Read.Length = ChunkLen;
+                IrpSp->Parameters.Read.ByteOffset.QuadPart = ChunkLba;
 
                 IoSetCompletionRoutine(
-                    Irp,
+                    ChunkIrp,
                     bCanWait ?
                     Ext2ReadWriteBlockSyncCompletionRoutine :
                     Ext2ReadWriteBlockAsyncCompletionRoutine,
@@ -382,42 +402,59 @@ Ext2ReadWriteBlocks(
                     TRUE,
                     TRUE );
 
-                IrpSp = IoGetNextIrpStackLocation(Irp);
+                IrpSp = IoGetNextIrpStackLocation(ChunkIrp);
 
                 IrpSp->MajorFunction = IrpContext->MajorFunction;
-                IrpSp->Parameters.Read.Length =Extent->Length;
-                IrpSp->Parameters.Read.ByteOffset.QuadPart = Extent->Lba;
+                IrpSp->Parameters.Read.Length = ChunkLen;
+                IrpSp->Parameters.Read.ByteOffset.QuadPart = ChunkLba;
 
-                /* set write through flag */
                 if (IsFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WRITE_THROUGH)) {
                     SetFlag( IrpSp->Flags, SL_WRITE_THROUGH );
                 }
-
-                /* set verify flag */
                 if (IsFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_VERIFY_READ)) {
                     SetFlag(IrpSp->Flags, SL_OVERRIDE_VERIFY_VOLUME);
                 }
 
-                Extent->Irp = Irp;
-                pContext->Blocks += 1;
-            }
+                ChunkIrps[nChunks++] = ChunkIrp;
 
-            MasterIrp->AssociatedIrp.IrpCount = pContext->Blocks;
-            if (bCanWait) {
-                MasterIrp->AssociatedIrp.IrpCount += 1;
+                ExtentDone   += ChunkLen;
+                ExtentRemain -= ChunkLen;
             }
         }
+
+        /*
+         * Phase 2: set IrpCount and Blocks atomically before any submission.
+         *
+         * IrpCount must be set before the first IoCallDriver so that a
+         * fast-completing chunk cannot decrement it below zero and trigger a
+         * spurious master-IRP completion.
+         *
+         * For bCanWait we add 1 to keep the master alive until we call
+         * KeWaitForSingleObject (the sync completion routine fires the event
+         * when Blocks reaches 0, which is fine, but we need IrpCount to stay
+         * positive until after our wait returns; the extra +1 is decremented
+         * implicitly by the I/O Manager when we return from this function and
+         * the caller completes the master).
+         */
+        pContext->Blocks = nChunks;
+        MasterIrp->AssociatedIrp.IrpCount = nChunks;
+        if (bCanWait) {
+            MasterIrp->AssociatedIrp.IrpCount += 1;
+        }
+
         if (!bCanWait) {
-            /* mark MasterIrp pending */
             IoMarkIrpPending(pContext->MasterIrp);
         }
 
         bBugCheck = TRUE;
 
-        for (Extent = Chain; Extent != NULL; Extent = Extent->Next) {
-            Status = IoCallDriver ( Vcb->TargetDeviceObject,
-                                    Extent->Irp);
-            Extent->Irp = NULL;
+        /*
+         * Phase 3: submit all chunk IRPs to the device in one pass.
+         * After this point the completion routines own the IRPs.
+         */
+        for (i = 0; i < nChunks; i++) {
+            Status = IoCallDriver(Vcb->TargetDeviceObject, ChunkIrps[i]);
+            ChunkIrps[i] = NULL;   /* owned by completion routine now */
         }
 
         if (bCanWait) {
@@ -426,7 +463,6 @@ Ext2ReadWriteBlocks(
             Status = KeWaitForSingleObject( &(pContext->Event),
                                    Executive, KernelMode, FALSE, &Timeout );
             if (Status == STATUS_TIMEOUT) {
-                /* Keep pContext alive until late completions stop using it. */
                 MasterIrp->IoStatus.Status = STATUS_IO_TIMEOUT;
                 MasterIrp->IoStatus.Information = 0;
                 KeWaitForSingleObject( &(pContext->Event),
@@ -439,12 +475,15 @@ Ext2ReadWriteBlocks(
 
     } __finally {
 
-        for (Extent = Chain; Extent != NULL; Extent = Extent->Next)  {
-            if (Extent->Irp != NULL ) {
-                if (Extent->Irp->MdlAddress != NULL) {
-                    IoFreeMdl(Extent->Irp->MdlAddress );
+        /* Free any chunk IRPs that were not yet submitted (build-phase failure) */
+        if (ChunkIrps != NULL) {
+            for (i = 0; i < nChunks; i++) {
+                if (ChunkIrps[i] != NULL) {
+                    if (ChunkIrps[i]->MdlAddress != NULL) {
+                        IoFreeMdl(ChunkIrps[i]->MdlAddress);
+                    }
+                    IoFreeIrp(ChunkIrps[i]);
                 }
-                IoFreeIrp(Extent->Irp);
             }
         }
 
@@ -468,8 +507,15 @@ Ext2ReadWriteBlocks(
                 if (bMasterCompleted) {
                     IrpContext->Irp = NULL;
                     Status = STATUS_PENDING;
+                } else if (pContext) {
+                    Ext2FreePool(pContext, EXT2_RWC_MAGIC);
+                    DEC_MEM_COUNT(PS_RW_CONTEXT, pContext, sizeof(EXT2_RW_CONTEXT));
                 }
             }
+        }
+
+        if (ChunkIrps != NULL) {
+            Ext2FreePool(ChunkIrps, 'RI2E');
         }
     }
 

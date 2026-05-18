@@ -141,8 +141,6 @@ Ext2DoExtentExpand(
     if (Block)
         *Block = (ULONG)bh_got.b_blocknr;
 
-    Ext2SaveInode(IrpContext, Vcb, &Mcb->Inode);
-
     return STATUS_SUCCESS;
 }
 

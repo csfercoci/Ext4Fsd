@@ -323,7 +323,7 @@ Ext2WriteVolume (IN PEXT2_IRP_CONTEXT IrpContext)
             if ( !CcCanIWrite(
                         FileObject,
                         Length,
-                        (bWait && bQueue),
+                        (bWait && !bQueue),
                         bAgain ) ) {
 
                 Status = Ext2LockUserBuffer(
@@ -861,7 +861,7 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
             if ( !CcCanIWrite(
                         FileObject,
                         Length,
-                        (bWait && bQueue),
+                        (bWait && !bQueue),
                         bAgain ) ) {
 
                 Status = Ext2LockUserBuffer(
@@ -1028,7 +1028,7 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
 
             if ((ByteOffset.QuadPart + Length) > Fcb->Header.FileSize.QuadPart) {
 
-                LARGE_INTEGER AllocationSize, Last;
+                LARGE_INTEGER AllocationSize, Last, NeededSize;
 
                 if (!ExAcquireResourceExclusiveLite(&Fcb->PagingIoResource, TRUE)) {
                     Status = STATUS_PENDING;
@@ -1040,22 +1040,58 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                 SetFlag(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT);
 
                 Last.QuadPart = Fcb->Header.AllocationSize.QuadPart;
-                AllocationSize.QuadPart = (LONGLONG)(ByteOffset.QuadPart + Length);
+                NeededSize.QuadPart = (LONGLONG)(ByteOffset.QuadPart + Length);
                 AllocationSize.QuadPart = CEILING_ALIGNED(ULONGLONG,
-                                          (ULONGLONG)AllocationSize.QuadPart,
+                                          (ULONGLONG)NeededSize.QuadPart,
                                           (ULONGLONG)BLOCK_SIZE);
+
+                if (!Nocache && !PagingIo &&
+                    ByteOffset.QuadPart == Fcb->Header.FileSize.QuadPart) {
+
+                    LONGLONG Extra = (LONGLONG)Length * 16;
+
+                    if (Extra < (1 * 1024 * 1024)) {
+                        Extra = 1 * 1024 * 1024;
+                    } else if (Extra > (16 * 1024 * 1024)) {
+                        Extra = 16 * 1024 * 1024;
+                    }
+
+                    AllocationSize.QuadPart = CEILING_ALIGNED(ULONGLONG,
+                                              (ULONGLONG)(NeededSize.QuadPart + Extra),
+                                              (ULONGLONG)BLOCK_SIZE);
+                }
 
                 /* tell Ext2ExpandFile to allocate unwritten extent or NULL blocks
                    for indirect files, otherwise we might get gabage data in holes */
                 {
-                    OwnsExpandTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
-                    IrpContext->MajorFunction += IRP_MJ_MAXIMUM_FUNCTION;
-                    Status = Ext2ExpandFile(IrpContext, Vcb, Fcb->Mcb, &AllocationSize);
-                    IrpContext->MajorFunction -= IRP_MJ_MAXIMUM_FUNCTION;
                     if (AllocationSize.QuadPart > Last.QuadPart) {
-                        Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
-                        SetLongFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
+                        OwnsExpandTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
+                        IrpContext->MajorFunction += IRP_MJ_MAXIMUM_FUNCTION;
+                        Status = Ext2ExpandFile(IrpContext, Vcb, Fcb->Mcb, &AllocationSize);
+                        IrpContext->MajorFunction -= IRP_MJ_MAXIMUM_FUNCTION;
+
+                        if (!NT_SUCCESS(Status) && AllocationSize.QuadPart > NeededSize.QuadPart) {
+                            AllocationSize.QuadPart = CEILING_ALIGNED(ULONGLONG,
+                                                      (ULONGLONG)NeededSize.QuadPart,
+                                                      (ULONGLONG)BLOCK_SIZE);
+                            IrpContext->MajorFunction += IRP_MJ_MAXIMUM_FUNCTION;
+                            Status = Ext2ExpandFile(IrpContext, Vcb, Fcb->Mcb, &AllocationSize);
+                            IrpContext->MajorFunction -= IRP_MJ_MAXIMUM_FUNCTION;
+                        }
+
+                        if (OwnsExpandTxn) {
+                            Ext2JournalStop(IrpContext, Vcb);
+                            OwnsExpandTxn = FALSE;
+                        }
+
+                        if (AllocationSize.QuadPart > Last.QuadPart) {
+                            Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
+                        }
+
+                    } else {
+                        Status = STATUS_SUCCESS;
                     }
+
                     ExReleaseResourceLite(&Fcb->PagingIoResource);
                     PagingIoResourceAcquired = FALSE;
 
@@ -1072,6 +1108,7 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                     }
 
                     Fcb->Header.FileSize.QuadPart = Fcb->Inode->i_size = ByteOffset.QuadPart + Length;
+                    SetLongFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
 
                     if (CcIsFileCached(FileObject)) {
                         CcSetFileSizes(FileObject, (PCC_FILE_SIZES)(&(Fcb->Header.AllocationSize)));

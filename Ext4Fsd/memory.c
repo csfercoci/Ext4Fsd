@@ -2825,6 +2825,9 @@ Ext2DestroyVcb (IN PEXT2_VCB Vcb)
         journal_t *journal = Vcb->sbi.s_journal;
         PEXT2_MCB  jcb = (PEXT2_MCB)Vcb->sbi.s_journal_mcb;
 
+        /* Commit any deferred pending journal before tearing down. */
+        Ext2JournalFlushPending(Vcb);
+
         Vcb->sbi.s_journal = NULL;
         Vcb->sbi.s_journal_mcb = NULL;
 
