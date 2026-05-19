@@ -36,7 +36,9 @@ Ext2ExceptionFilter (
              ExceptionPointer->ContextRecord);
     DbgPrint("-------------------------------------------------------------\n");
 
-    DbgBreak();
+    /* Do not break here unless a kernel debugger is attached.  A breakpoint
+       raised from the exception filter can recursively re-enter this filter
+       and exhaust the kernel stack on normal test machines. */
 
     //
     // Check IrpContext is valid or not
@@ -45,7 +47,6 @@ Ext2ExceptionFilter (
     if (IrpContext) {
         if ((IrpContext->Identifier.Type != EXT2ICX) ||
             (IrpContext->Identifier.Size != sizeof(EXT2_IRP_CONTEXT))) {
-            DbgBreak();
             IrpContext = NULL;
         } else if (IrpContext->DeviceObject) {
             PEXT2_VCB Vcb = NULL;
@@ -117,7 +118,6 @@ Ext2ExceptionHandler (IN PEXT2_IRP_CONTEXT IrpContext)
 
         if ( (IrpContext->Identifier.Type != EXT2ICX) ||
                 (IrpContext->Identifier.Size != sizeof(EXT2_IRP_CONTEXT))) {
-            DbgBreak();
             return STATUS_UNSUCCESSFUL;
         }
 

@@ -257,8 +257,8 @@ Ext2FreeFcb (IN PEXT2_FCB Fcb)
         Fcb->Identifier.Type = 0;
         Fcb->Identifier.Size = 0;
 
-        ExFreeToLookasideListEx(&(Ext2Global->Ext2FcbLookasideList), Fcb);
         DEC_MEM_COUNT(PS_FCB, Fcb, sizeof(EXT2_FCB));
+        ExFreeToLookasideListEx(&(Ext2Global->Ext2FcbLookasideList), Fcb);
 
         if (0 == Ext2DerefXcb(&Vcb->ReferenceCount)) {
             if (!IsMounted(Vcb) || IsDispending(Vcb)) {
