@@ -261,7 +261,7 @@ static int ext4_ext_get_access(void *icb, handle_t *handle, struct inode *inode,
 	if (path->p_bh) {
 		/* path points to block */
 
-		return ext4_journal_get_write_access(icb, handle, path->p_bh);
+		return ext4_journal_get_write_access(handle, icb, path->p_bh);
 
 	}
 	/* path points to leaf/index in inode body */
@@ -852,7 +852,7 @@ static int ext4_ext_split(void *icb, handle_t *handle, struct inode *inode,
 		goto cleanup;
 	}
 
-	err = ext4_journal_get_create_access(icb, handle, bh);
+	err = ext4_journal_get_create_access(handle, icb, bh);
 	if (err)
 		goto cleanup;
 
@@ -884,7 +884,7 @@ static int ext4_ext_split(void *icb, handle_t *handle, struct inode *inode,
 	ext4_extent_block_csum_set(inode, neh);
 	set_buffer_uptodate(bh);
 
-	err = ext4_handle_dirty_metadata(icb, handle, inode, bh);
+	err = ext4_handle_dirty_metadata(handle, icb, inode, bh);
 	if (err)
 		goto cleanup;
 	extents_brelse(bh);
@@ -923,7 +923,7 @@ static int ext4_ext_split(void *icb, handle_t *handle, struct inode *inode,
 			goto cleanup;
 		}
 
-		err = ext4_journal_get_create_access(icb, handle, bh);
+		err = ext4_journal_get_create_access(handle, icb, bh);
 		if (err)
 			goto cleanup;
 
@@ -961,7 +961,7 @@ static int ext4_ext_split(void *icb, handle_t *handle, struct inode *inode,
 		ext4_extent_block_csum_set(inode, neh);
 		set_buffer_uptodate(bh);
 
-		err = ext4_handle_dirty_metadata(icb, handle, inode, bh);
+		err = ext4_handle_dirty_metadata(handle, icb, inode, bh);
 		if (err)
 			goto cleanup;
 		extents_brelse(bh);
@@ -1032,7 +1032,7 @@ static int ext4_ext_grow_indepth(void *icb, handle_t *handle, struct inode *inod
 	if (!bh)
 		return -ENOMEM;
 
-	err = ext4_journal_get_create_access(icb, handle, bh);
+	err = ext4_journal_get_create_access(handle, icb, bh);
 	if (err)
 		goto out;
 
@@ -1052,7 +1052,7 @@ static int ext4_ext_grow_indepth(void *icb, handle_t *handle, struct inode *inod
 	ext4_extent_block_csum_set(inode, neh);
 	set_buffer_uptodate(bh);
 
-	err = ext4_handle_dirty_metadata(icb, handle, inode, bh);
+	err = ext4_handle_dirty_metadata(handle, icb, inode, bh);
 	if (err)
 		goto out;
 
