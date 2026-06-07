@@ -374,6 +374,8 @@ out_release:
 
 /* ==================== Public API ==================== */
 
+static void Ext2FlushDirtyData(PEXT2_VCB Vcb);
+
 handle_t *__ext4_journal_start_sb(void *icb, struct super_block *sb, unsigned int line,
                   int type, int blocks, int rsv_blocks)
 {
@@ -493,11 +495,10 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
          * pending pointer, otherwise kjournald would read the new handle
          * and the old metadata would be kfree'd uncommitted (corruption).
          *
-         * Note: caller holds MainResource exclusive (Ext2WriteFile path).
-         * journal_commit_sync does NOT take MainResource, so no deadlock.
-         * The 2x Ext2FlushDiskCache calls inside are the actual blocker,
-         * but they're unavoidable for data safety. */
+         * Data=ordered: flush dirty file data before committing metadata
+         * so that data blocks are on disk before metadata references them. */
         mutex_unlock(&journal->j_checkpoint_mutex);
+        Ext2FlushDirtyData(Vcb);
         err = journal_commit_sync(pending);
         kfree(pending);
 
@@ -613,6 +614,46 @@ int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
 }
 
 /*
+ * Data=ordered: flush all dirty file data to disk.
+ * Called BEFORE metadata journal commit — ensures data blocks
+ * referenced by metadata are physically on disk, like Linux
+ * ext4 data=ordered mode.  Without this, a crash after metadata
+ * commit could leave metadata pointing to stale/unwritten data.
+ *
+ * Safe to call from any context (kjournald, overflow path, flush).
+ * No filesystem locks required — CcFlushCache is self-synchronizing.
+ */
+static void
+Ext2FlushDirtyData(PEXT2_VCB Vcb)
+{
+    PEXT2_FCB Fcb;
+    PLIST_ENTRY ListEntry;
+
+    if (IsVcbReadOnly(Vcb))
+        return;
+
+    ExAcquireResourceSharedLite(&Vcb->FcbLock, TRUE);
+
+    for (ListEntry = Vcb->FcbList.Flink;
+         ListEntry != &Vcb->FcbList;
+         ListEntry = ListEntry->Flink) {
+
+        Fcb = CONTAINING_RECORD(ListEntry, EXT2_FCB, Next);
+
+        if (IsDirectory(Fcb))
+            continue;
+        if (IsFlagOn(Fcb->Flags, FCB_DELETE_PENDING))
+            continue;
+        if (Fcb->SectionObject.DataSectionObject == NULL)
+            continue;
+
+        CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
+    }
+
+    ExReleaseResourceLite(&Vcb->FcbLock);
+}
+
+/*
  * Flush and free any pending deferred journal handle on this VCB.
  * Called at explicit flush, volume purge, and VCB destroy time.
  * Must be called while the caller holds appropriate VCB locks.
@@ -637,6 +678,8 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
     mutex_unlock(&journal->j_checkpoint_mutex);
 
     if (pending) {
+        /* Data=ordered: flush file data before metadata commit */
+        Ext2FlushDirtyData(Vcb);
         journal_commit_sync(pending);
         kfree(pending);
     }
@@ -708,6 +751,8 @@ Ext2KjournaldThread(PVOID Context)
         mutex_unlock(&journal->j_checkpoint_mutex);
 
         if (pending) {
+            /* Data=ordered: flush file data before metadata commit */
+            Ext2FlushDirtyData(Vcb);
             journal_commit_sync(pending);
             kfree(pending);
         }
