@@ -15,8 +15,8 @@ static inline int ext4_handle_valid(handle_t *handle)
 
 #define MAX_HANDLE_REVOKES   256
 
-#define EXT2_COMMIT_INTERVAL_SECONDS  10
-#define EXT2_BATCH_DELAY_MS           20
+#define EXT2_COMMIT_INTERVAL_SECONDS  5
+#define EXT2_BATCH_DELAY_MS           5000
 
 struct ext4_handle {
     handle_t            h;
@@ -488,11 +488,30 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
             return 0;
         }
 
-        /* Pending handle full -- commit it now, then become new pending. */
-        Vcb->PendingJournalHandle = (void *)eh;
+        /* Pending handle full -- commit the old one synchronously, then
+         * become the new pending.  We must commit BEFORE replacing the
+         * pending pointer, otherwise kjournald would read the new handle
+         * and the old metadata would be kfree'd uncommitted (corruption).
+         *
+         * Note: caller holds MainResource exclusive (Ext2WriteFile path).
+         * journal_commit_sync does NOT take MainResource, so no deadlock.
+         * The 2x Ext2FlushDiskCache calls inside are the actual blocker,
+         * but they're unavoidable for data safety. */
         mutex_unlock(&journal->j_checkpoint_mutex);
         err = journal_commit_sync(pending);
         kfree(pending);
+
+        mutex_lock(&journal->j_checkpoint_mutex);
+        Vcb->PendingJournalHandle = (void *)eh;
+        mutex_unlock(&journal->j_checkpoint_mutex);
+
+        /* Arm batch timer for the new pending handle */
+        if (Vcb->KjournaldThread && !Vcb->BatchTimerArmed) {
+            LARGE_INTEGER batchDue;
+            batchDue.QuadPart = (LONGLONG)-10 * 1000 * EXT2_BATCH_DELAY_MS;
+            KeSetTimer(&Vcb->BatchTimer, batchDue, &Vcb->BatchDpc);
+            Vcb->BatchTimerArmed = TRUE;
+        }
         return err;
     }
 
