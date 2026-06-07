@@ -15,6 +15,9 @@ static inline int ext4_handle_valid(handle_t *handle)
 
 #define MAX_HANDLE_REVOKES   256
 
+#define EXT2_COMMIT_INTERVAL_SECONDS  10
+#define EXT2_BATCH_DELAY_MS           5
+
 struct ext4_handle {
     handle_t            h;
     int                 nbuffers;
@@ -441,6 +444,7 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
 
     if (Vcb) {
         journal_t *journal = eh->journal;
+        LARGE_INTEGER batchDue;
 
         mutex_lock(&journal->j_checkpoint_mutex);
         pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
@@ -449,9 +453,12 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
             /* Become the pending handle -- don't commit yet. */
             Vcb->PendingJournalHandle = (void *)eh;
             mutex_unlock(&journal->j_checkpoint_mutex);
-            /* Wake kjournald so it commits promptly */
-            if (Vcb->KjournaldThread)
-                KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+            /* Arm batch timer: commit after BatchDelayMs */
+            if (Vcb->KjournaldThread && !Vcb->BatchTimerArmed) {
+                batchDue.QuadPart = (LONGLONG)-10 * 1000 * EXT2_BATCH_DELAY_MS;
+                KeSetTimer(&Vcb->BatchTimer, batchDue, &Vcb->BatchDpc);
+                Vcb->BatchTimerArmed = TRUE;
+            }
             return 0;
         }
 
@@ -477,9 +484,7 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
 
             mutex_unlock(&journal->j_checkpoint_mutex);
             kfree(eh);
-            /* Wake kjournald so it commits promptly */
-            if (Vcb->KjournaldThread)
-                KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+            /* Timer already armed from first stop — don't re-arm */
             return 0;
         }
 
@@ -619,20 +624,32 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
 }
 
 /*
+ * Batch DPC: fires after BatchDelayMs from the first ext4_journal_stop.
+ * Signals kjournald to commit whatever accumulated in the pending handle.
+ */
+static VOID
+Ext2BatchDpc(PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2)
+{
+    PEXT2_VCB Vcb = (PEXT2_VCB)DeferredContext;
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    Vcb->BatchTimerArmed = FALSE;
+    KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+}
+
+/*
  * kjournald -- dedicated journal commit thread per mounted volume.
  *
- * Equivalent of Linux's kjournald: wakes every CommitIntervalSeconds (10s)
- * or on demand (Ext2JournalForceCommit from fsync/flush).  Commits the
- * pending deferred journal handle in bulk, replacing the old model where
- * SyncReaper called Ext2JournalFlushPending under MainResource.
+ * Wakes on:
+ * - Batch timer (5ms after first stop) — batches burst writes
+ * - Force-commit signal (fsync/flush) — immediate commit
+ * - Safety-net timeout (10s) — catches stragglers
  *
- * The thread runs at PASSIVE_LEVEL, takes j_checkpoint_mutex only briefly
- * to swap the pending handle pointer, then commits outside the lock.
- * No MainResource or global lock is held during commit, so this never
- * blocks Explorer/dir/fsutil.
+ * Commits the pending deferred journal handle in bulk.
+ * No MainResource or global lock is held during commit.
  */
-
-#define EXT2_COMMIT_INTERVAL_SECONDS  10
 
 static VOID
 Ext2KjournaldThread(PVOID Context)
@@ -694,11 +711,16 @@ Ext2StartKjournald(PEXT2_VCB Vcb)
     OBJECT_ATTRIBUTES oa;
     HANDLE handle = NULL;
     LARGE_INTEGER timeout;
+    LARGE_INTEGER batchDelay;
 
     KeInitializeEvent(&Vcb->KjournaldWake, SynchronizationEvent, FALSE);
     KeInitializeEvent(&Vcb->KjournaldDone, SynchronizationEvent, FALSE);
     Vcb->KjournaldStop = FALSE;
     Vcb->KjournaldThread = NULL;
+    Vcb->BatchTimerArmed = FALSE;
+
+    KeInitializeTimer(&Vcb->BatchTimer);
+    KeInitializeDpc(&Vcb->BatchDpc, Ext2BatchDpc, (PVOID)Vcb);
 
     InitializeObjectAttributes(&oa, NULL, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
 
@@ -724,8 +746,8 @@ Ext2StartKjournald(PEXT2_VCB Vcb)
     timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 2;
     KeWaitForSingleObject(&Vcb->KjournaldDone, Executive, KernelMode, FALSE, &timeout);
 
-    DEBUG(DL_INF, ("Ext4Fsd: kjournald started (commit interval=%us)\n",
-                   EXT2_COMMIT_INTERVAL_SECONDS));
+    DEBUG(DL_INF, ("Ext4Fsd: kjournald started (commit interval=%us, batch delay=%ums)\n",
+                   EXT2_COMMIT_INTERVAL_SECONDS, EXT2_BATCH_DELAY_MS));
     return STATUS_SUCCESS;
 }
 
@@ -736,6 +758,10 @@ Ext2StopKjournald(PEXT2_VCB Vcb)
 
     if (!Vcb->KjournaldThread)
         return;
+
+    /* Cancel any pending batch timer */
+    KeCancelTimer(&Vcb->BatchTimer);
+    Vcb->BatchTimerArmed = FALSE;
 
     Vcb->KjournaldStop = TRUE;
     KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
@@ -753,7 +779,7 @@ Ext2StopKjournald(PEXT2_VCB Vcb)
 /*
  * Force an immediate journal commit for this volume.
  * Called from fsync / FlushFileBuffers / flush IRP paths.
- * Wakes kjournald and waits for the commit to complete.
+ * Cancels the batch timer and wakes kjournald immediately.
  */
 NTSTATUS
 Ext2JournalForceCommit(PEXT2_VCB Vcb)
@@ -771,6 +797,10 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     /* If no pending handle, nothing to commit */
     if (!Vcb->PendingJournalHandle)
         return STATUS_SUCCESS;
+
+    /* Cancel batch timer — we're committing now */
+    KeCancelTimer(&Vcb->BatchTimer);
+    Vcb->BatchTimerArmed = FALSE;
 
     /* Wake kjournald */
     KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);

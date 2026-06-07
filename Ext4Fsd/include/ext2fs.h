@@ -769,6 +769,13 @@ typedef struct _EXT2_VCB {
     KEVENT                      KjournaldDone;
     BOOLEAN                     KjournaldStop;
 
+    /* Batch timer: after the first ext4_journal_stop, waits BatchDelayMs
+     * before waking kjournald. All stops within that window merge into
+     * the same pending handle → single commit for N files. */
+    KTIMER                      BatchTimer;
+    KDPC                        BatchDpc;
+    BOOLEAN                     BatchTimerArmed;
+
     /* Maximum file size in blocks ... */
     ULONG                       max_blocks_per_layer[EXT2_BLOCK_TYPES];
     ULONG                       max_data_blocks;
