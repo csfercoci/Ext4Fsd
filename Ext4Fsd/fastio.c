@@ -1030,20 +1030,20 @@ Ext2AcquireFileForModWrite (
 )
 
 {
-    BOOLEAN ResourceAcquired = FALSE;
-
     PEXT2_FCB Fcb = FileObject->FsContext;
 
-    *ResourceToRelease = Fcb->Header.Resource;
-    ResourceAcquired = ExAcquireResourceExclusiveLite(*ResourceToRelease, FALSE);
-    if (!ResourceAcquired) {
-        *ResourceToRelease = NULL;
-    }
+    UNREFERENCED_PARAMETER(EndingOffset);
+    UNREFERENCED_PARAMETER(DeviceObject);
 
-    DEBUG(FASTIO_DEBUG_LEVEL, ("Ext2AcquireFileForModWrite:  Fcb=%p Acquired=%d\n",
-                             Fcb, ResourceAcquired));
+    /* Paging I/O write completion runs on MiMappedPageWriter thread,
+     * not the thread that calls AcquireForModWrite.  ExReleaseResourceLite
+     * checks thread ownership, so acquiring here BUGCHECKs 0xE3 when
+     * APC completion calls ReleaseForModWrite on a different thread. */
+    *ResourceToRelease = NULL;
 
-    return (ResourceAcquired ? STATUS_SUCCESS : STATUS_CANT_WAIT);
+    DEBUG(FASTIO_DEBUG_LEVEL, ("Ext2AcquireFileForModWrite: Fcb=%p skip acquire\n", Fcb));
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -1055,13 +1055,13 @@ Ext2ReleaseFileForModWrite (
 {
     PEXT2_FCB Fcb = FileObject->FsContext;
 
+    UNREFERENCED_PARAMETER(DeviceObject);
+
     DEBUG(FASTIO_DEBUG_LEVEL, ("Ext2ReleaseFileForModWrite: Fcb=%p\n", Fcb));
 
     if (ResourceToRelease != NULL) {
         ASSERT(ResourceToRelease == Fcb->Header.Resource);
         ExReleaseResourceLite(ResourceToRelease);
-    } else {
-        DbgBreak();
     }
 
     return STATUS_SUCCESS;

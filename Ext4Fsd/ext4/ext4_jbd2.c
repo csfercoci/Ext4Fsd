@@ -491,13 +491,15 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
         }
 
         /* Pending handle full -- commit the old one synchronously, then
-         * become the new pending.  We must commit BEFORE replacing the
-         * pending pointer, otherwise kjournald would read the new handle
-         * and the old metadata would be kfree'd uncommitted (corruption).
+         * become the new pending.  We must NULL the pointer BEFORE kfree
+         * so that kjournald (woken by batch timer/force-commit) never sees
+         * a dangling pointer into freed heap.
          *
          * Data=ordered: flush dirty file data before committing metadata
          * so that data blocks are on disk before metadata references them. */
+        Vcb->PendingJournalHandle = NULL;
         mutex_unlock(&journal->j_checkpoint_mutex);
+
         Ext2FlushDirtyData(Vcb);
         err = journal_commit_sync(pending);
         kfree(pending);
