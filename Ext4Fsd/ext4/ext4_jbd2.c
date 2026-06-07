@@ -16,7 +16,7 @@ static inline int ext4_handle_valid(handle_t *handle)
 #define MAX_HANDLE_REVOKES   256
 
 #define EXT2_COMMIT_INTERVAL_SECONDS  10
-#define EXT2_BATCH_DELAY_MS           5
+#define EXT2_BATCH_DELAY_MS           20
 
 struct ext4_handle {
     handle_t            h;
