@@ -166,9 +166,12 @@ Ext2ReadVolume (IN PEXT2_IRP_CONTEXT IrpContext)
 
             if (!FlagOn(Ccb->Flags, CCB_VOLUME_DASD_PURGE)) {
 
-                if (!FlagOn(Vcb->Flags, VCB_VOLUME_LOCKED)) {
-                    Ext2FlushVolume(IrpContext, Vcb, FALSE);
-                }
+                /*
+                 * Do not flush the whole volume on a direct/DASD read.  Tools
+                 * such as fsutil and Explorer can issue volume reads during
+                 * probing, and synchronously flushing here while holding the
+                 * VCB main resource can deadlock the caller.
+                 */
 
                 SetFlag(Ccb->Flags, CCB_VOLUME_DASD_PURGE);
             }

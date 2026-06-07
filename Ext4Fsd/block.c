@@ -11,6 +11,13 @@
 
 #include "ext2fs.h"
 
+/* IOCTL_DISK_FLUSH_CACHE — flush the disk device's volatile write cache to
+ * stable media.  Not defined in older ntdddisk.h; the value below matches
+ * the WDK definition (IOCTL_DISK_BASE, function 0x0029). */
+#ifndef IOCTL_DISK_FLUSH_CACHE
+#define IOCTL_DISK_FLUSH_CACHE CTL_CODE(IOCTL_DISK_BASE, 0x0029, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#endif
+
 /* GLOBALS ***************************************************************/
 
 extern PEXT2_GLOBAL Ext2Global;
@@ -32,6 +39,7 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, Ext2LockUserBuffer)
 #pragma alloc_text(PAGE, Ext2ReadSync)
+#pragma alloc_text(PAGE, Ext2WriteSync)
 #pragma alloc_text(PAGE, Ext2ReadDisk)
 #pragma alloc_text(PAGE, Ext2DiskIoControl)
 #pragma alloc_text(PAGE, Ext2DiskShutDown)
@@ -582,7 +590,7 @@ Ext2ReadSync(
             Timeout.QuadPart = (LONGLONG)-30 * 10 * 1000 * 1000; /* 30 seconds */
             Status = KeWaitForSingleObject(
                 Event,
-                Suspended,
+                Executive,
                 KernelMode,
                 FALSE,
                 &Timeout
@@ -652,6 +660,116 @@ errorout:
     if (Buf) {
         Ext2FreePool(Buf, EXT2_DATA_MAGIC);
         DEC_MEM_COUNT(PS_DISK_BUFFER, Buf, Length);
+    }
+
+    return Status;
+}
+
+/*
+ * Synchronous, non-cached write of a buffer straight to the underlying disk
+ * at a byte Offset.  Mirror of Ext2ReadSync.  This is the real-I/O primitive
+ * the journal and metadata writeback use so durability does NOT depend on the
+ * Cache Manager lazy writer.  Offset and Length must be sector aligned.
+ */
+NTSTATUS
+Ext2WriteSync(
+    IN PEXT2_VCB        Vcb,
+    IN ULONGLONG        Offset,
+    IN ULONG            Length,
+    IN PVOID            Buffer
+)
+{
+    PAGED_CODE();
+    PKEVENT         Event = NULL;
+    PIRP            Irp;
+    IO_STATUS_BLOCK IoStatus;
+    NTSTATUS        Status = STATUS_INSUFFICIENT_RESOURCES;
+
+    ASSERT(Vcb != NULL);
+    ASSERT(Vcb->TargetDeviceObject != NULL);
+    ASSERT(Buffer != NULL);
+
+    if (IsVcbReadOnly(Vcb))
+        return STATUS_MEDIA_WRITE_PROTECTED;
+
+    __try {
+
+        Event = Ext2AllocatePool(NonPagedPool, sizeof(KEVENT), 'EK2E');
+        if (NULL == Event) {
+            DEBUG(DL_ERR, ( "Ext2WriteSync: failed to allocate Event.\n"));
+            __leave;
+        }
+        INC_MEM_COUNT(PS_DISK_EVENT, Event, sizeof(KEVENT));
+        KeInitializeEvent(Event, NotificationEvent, FALSE);
+
+        Irp = IoBuildSynchronousFsdRequest(
+                  IRP_MJ_WRITE,
+                  Vcb->TargetDeviceObject,
+                  Buffer,
+                  Length,
+                  (PLARGE_INTEGER)(&Offset),
+                  Event,
+                  &IoStatus
+              );
+
+        if (!Irp) {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            __leave;
+        }
+
+        Status = IoCallDriver(Vcb->TargetDeviceObject, Irp);
+
+        if (Status == STATUS_PENDING) {
+            LARGE_INTEGER Timeout;
+            Timeout.QuadPart = (LONGLONG)-30 * 10 * 1000 * 1000; /* 30 seconds */
+            Status = KeWaitForSingleObject(
+                Event, Executive, KernelMode, FALSE, &Timeout);
+            if (Status == STATUS_TIMEOUT) {
+                IoCancelIrp(Irp);
+                KeWaitForSingleObject(Event, Executive, KernelMode, FALSE, NULL);
+                Status = STATUS_IO_TIMEOUT;
+            } else {
+                Status = IoStatus.Status;
+            }
+        }
+
+    } __finally {
+
+        if (Event) {
+            Ext2FreePool(Event, 'EK2E');
+            DEC_MEM_COUNT(PS_DISK_EVENT, Event, sizeof(KEVENT));
+        }
+    }
+
+    return Status;
+}
+
+/*
+ * Force the underlying disk to flush its volatile write cache to stable media.
+ * This is the ordering barrier used by the journal commit: after the journal
+ * blocks (or the commit block) are written, this guarantees they are durable
+ * before the next phase proceeds.  Best-effort: a device that does not support
+ * the IOCTL is treated as success (such devices generally have no volatile
+ * cache, or honour FUA semantics on their own).
+ */
+NTSTATUS
+Ext2FlushDiskCache(
+    IN PEXT2_VCB        Vcb )
+{
+    NTSTATUS Status;
+
+    if (IsVcbReadOnly(Vcb))
+        return STATUS_SUCCESS;
+
+    Status = Ext2DiskIoControl(
+                 Vcb->TargetDeviceObject,
+                 IOCTL_DISK_FLUSH_CACHE,
+                 NULL, 0,
+                 NULL, NULL );
+
+    if (Status == STATUS_INVALID_DEVICE_REQUEST ||
+        Status == STATUS_NOT_SUPPORTED) {
+        Status = STATUS_SUCCESS;
     }
 
     return Status;

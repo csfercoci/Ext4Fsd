@@ -2084,7 +2084,7 @@ Ext2DeleteFile(
             }
 
             /* set delete time and free the inode */
-            KeQuerySystemTime(&SysTime);
+            KeQuerySystemTimePrecise(&SysTime);
             Mcb->Inode.i_nlink = 0;
             /* Splice off orphan list before stamping i_dtime — same field
                is reused as NEXT_ORPHAN while on chain. */

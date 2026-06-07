@@ -75,7 +75,7 @@ Ext2FlushFile (
             if (!IsFlagOn(Ccb->Flags, CCB_LAST_WRITE_UPDATED)) {
 
                 LARGE_INTEGER   SysTime;
-                KeQuerySystemTime(&SysTime);
+                KeQuerySystemTimePrecise(&SysTime);
 
                 Ext2SetInodeTime(&SysTime, &Fcb->Inode->i_mtime, &Fcb->Inode->i_mtime_extra);
                 Fcb->Mcb->LastWriteTime = Ext2GetInodeTime(Fcb->Inode->i_mtime, Fcb->Inode->i_mtime_extra);
@@ -98,6 +98,26 @@ Ext2FlushFile (
             Ext2SaveInode(IrpContext, Fcb->Vcb, Fcb->Inode);
             ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
         }
+
+        /*
+         * Force-commit the pending journal handle so that the metadata
+         * we just saved (inode, extent tree, etc.) reaches disk before
+         * the caller's fsync / FlushFileBuffers returns.  Without this,
+         * the deferred commit by kjournald (10s interval) would leave a
+         * window where a crash loses the just-written metadata.
+         */
+        Ext2JournalForceCommit(Fcb->Vcb);
+
+        /*
+         * NOTE: do NOT flush the whole volume here.  Ext2FlushFile runs once
+         * per open file (e.g. Ext2FlushFiles iterates every Fcb at shutdown /
+         * dismount); a per-file full-volume CcFlushCache would mean N
+         * full-volume flushes and stalls system shutdown.  The deferred
+         * journal commit and the single full-volume metadata flush are done
+         * once at the volume level (Ext2FlushVolume -> Ext2FlushVcb), which
+         * runs right after the per-file pass; the inode home blocks saved
+         * above reach disk there.
+         */
 
     } __finally {
 

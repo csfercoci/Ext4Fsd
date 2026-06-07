@@ -335,7 +335,7 @@ new_buffer_head()
 
         memset(bh, 0, sizeof(struct buffer_head));
         InitializeListHead(&bh->b_link);
-        KeQuerySystemTime(&bh->b_ts_creat);
+        KeQuerySystemTimePrecise(&bh->b_ts_creat);
         DEBUG(DL_BH, ("bh=%p allocated.\n", bh));
         INC_MEM_COUNT(PS_BUFF_HEAD, bh, sizeof(struct buffer_head));
     }
@@ -811,7 +811,7 @@ void __brelse(struct buffer_head *bh)
         ExReleaseResourceLite(&bdev->bd_bh_lock);
         return;
     }
-    KeQuerySystemTime(&bh->b_ts_drop);
+    KeQuerySystemTimePrecise(&bh->b_ts_drop);
     RemoveEntryList(&bh->b_link);
     InsertTailList(&Vcb->bd.bd_bh_free, &bh->b_link);
     KeClearEvent(&Vcb->bd.bd_bh_notify);

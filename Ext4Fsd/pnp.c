@@ -166,6 +166,7 @@ Ext2PnpQueryRemove (
 
         Ext2FlushFiles(IrpContext, Vcb, FALSE);
         Ext2FlushVolume(IrpContext, Vcb, FALSE);
+        CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
 
         DEBUG(DL_PNP, ("Ext2PnpQueryRemove: Ext2LockVcb: Vcb=%xh FileObject=%xh ...\n",
                        Vcb, IrpContext->FileObject));

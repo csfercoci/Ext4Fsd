@@ -182,6 +182,7 @@ Ext2LockVolume (IN PEXT2_IRP_CONTEXT IrpContext)
         if (!IsVcbReadOnly(Vcb)) {
             Ext2FlushFiles(IrpContext, Vcb, FALSE);
             Ext2FlushVolume(IrpContext, Vcb, FALSE);
+            CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
         }
 
         Status = Ext2LockVcb(Vcb, IrpSp->FileObject);
@@ -2260,7 +2261,7 @@ Ext2MountVolume (IN PEXT2_IRP_CONTEXT IrpContext)
             }
 
             /* update fs mount time */
-            KeQuerySystemTime(&SysTime);
+            KeQuerySystemTimePrecise(&SysTime);
             Ext2TimeToSecondsSince1970(&SysTime, &LinuxTime.LowPart, &LinuxTime.HighPart);
             Vcb->SuperBlock->s_mtime = LinuxTime.LowPart;
             Vcb->SuperBlock->s_mtime_hi = (UCHAR)LinuxTime.HighPart;
@@ -2598,6 +2599,7 @@ Ext2DismountVolume (IN PEXT2_IRP_CONTEXT IrpContext)
 
         Ext2FlushFiles(IrpContext, Vcb, FALSE);
         Ext2FlushVolume(IrpContext, Vcb, FALSE);
+        CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
 
         ExReleaseResourceLite(&Vcb->MainResource);
         VcbResourceAcquired = FALSE;

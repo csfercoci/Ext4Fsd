@@ -160,7 +160,7 @@ Ext2Cleanup (IN PEXT2_IRP_CONTEXT IrpContext)
                     !IsFlagOn(Ccb->Flags, CCB_LAST_WRITE_UPDATED)) {
 
                 LARGE_INTEGER   SysTime;
-                KeQuerySystemTime(&SysTime);
+                KeQuerySystemTimePrecise(&SysTime);
 
                 Ext2SetInodeTime(&SysTime, &Fcb->Inode->i_mtime, &Fcb->Inode->i_mtime_extra);
                 Ext2SetInodeTime(&SysTime, &Fcb->Inode->i_atime, &Fcb->Inode->i_atime_extra);

@@ -273,7 +273,7 @@ __u32 ext3_current_time(struct inode *in)
     LARGE_INTEGER SysTime;
     ULONG hi, lo;
 
-    KeQuerySystemTime(&SysTime);
+    KeQuerySystemTimePrecise(&SysTime);
     Ext2SetInodeTime(&SysTime, &lo, &hi);
     in->i_ctime_extra = in->i_mtime_extra = hi;
     in->i_ctime = in->i_mtime = lo;

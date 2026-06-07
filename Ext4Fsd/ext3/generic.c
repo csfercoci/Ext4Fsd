@@ -351,8 +351,7 @@ Ext2FlushVcb(IN PEXT2_VCB Vcb)
 
     ASSERT(ExIsResourceAcquiredExclusiveLite(&Vcb->MainResource));
 
-    /* Flush any deferred pending journal handle before flushing VCB. */
-    Ext2JournalFlushPending(Vcb);
+    /* kjournald handles deferred journal commit; no need to flush here. */
 
     __try {
 

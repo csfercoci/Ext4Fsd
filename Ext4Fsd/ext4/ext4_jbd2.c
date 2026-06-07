@@ -449,6 +449,9 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
             /* Become the pending handle -- don't commit yet. */
             Vcb->PendingJournalHandle = (void *)eh;
             mutex_unlock(&journal->j_checkpoint_mutex);
+            /* Wake kjournald so it commits promptly */
+            if (Vcb->KjournaldThread)
+                KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
             return 0;
         }
 
@@ -474,6 +477,9 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
 
             mutex_unlock(&journal->j_checkpoint_mutex);
             kfree(eh);
+            /* Wake kjournald so it commits promptly */
+            if (Vcb->KjournaldThread)
+                KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
             return 0;
         }
 
@@ -610,4 +616,168 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
         journal_commit_sync(pending);
         kfree(pending);
     }
+}
+
+/*
+ * kjournald -- dedicated journal commit thread per mounted volume.
+ *
+ * Equivalent of Linux's kjournald: wakes every CommitIntervalSeconds (10s)
+ * or on demand (Ext2JournalForceCommit from fsync/flush).  Commits the
+ * pending deferred journal handle in bulk, replacing the old model where
+ * SyncReaper called Ext2JournalFlushPending under MainResource.
+ *
+ * The thread runs at PASSIVE_LEVEL, takes j_checkpoint_mutex only briefly
+ * to swap the pending handle pointer, then commits outside the lock.
+ * No MainResource or global lock is held during commit, so this never
+ * blocks Explorer/dir/fsutil.
+ */
+
+#define EXT2_COMMIT_INTERVAL_SECONDS  10
+
+static VOID
+Ext2KjournaldThread(PVOID Context)
+{
+    PEXT2_VCB Vcb = (PEXT2_VCB)Context;
+    journal_t *journal;
+    LARGE_INTEGER Timeout;
+    struct ext4_handle *pending;
+
+    journal = EXT4_SB(&Vcb->sb)->s_journal;
+    if (!journal)
+        PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
+
+    Timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * EXT2_COMMIT_INTERVAL_SECONDS;
+
+    while (!Vcb->KjournaldStop) {
+
+        KeWaitForSingleObject(
+            &Vcb->KjournaldWake,
+            Executive,
+            KernelMode,
+            FALSE,
+            &Timeout
+        );
+
+        KeClearEvent(&Vcb->KjournaldWake);
+
+        if (Vcb->KjournaldStop)
+            break;
+
+        /* Swap out the pending handle under lock */
+        mutex_lock(&journal->j_checkpoint_mutex);
+        pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
+        if (pending) {
+            Vcb->PendingJournalHandle = NULL;
+        }
+        mutex_unlock(&journal->j_checkpoint_mutex);
+
+        if (pending) {
+            journal_commit_sync(pending);
+            kfree(pending);
+        }
+
+        /* Signal any waiter (fsync/FlushFileBuffers) that commit is done */
+        KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+    }
+
+    /* Final flush on shutdown */
+    Ext2JournalFlushPending(Vcb);
+
+    KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+NTSTATUS
+Ext2StartKjournald(PEXT2_VCB Vcb)
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE handle = NULL;
+    LARGE_INTEGER timeout;
+
+    KeInitializeEvent(&Vcb->KjournaldWake, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&Vcb->KjournaldDone, SynchronizationEvent, FALSE);
+    Vcb->KjournaldStop = FALSE;
+    Vcb->KjournaldThread = NULL;
+
+    InitializeObjectAttributes(&oa, NULL, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    status = PsCreateSystemThread(
+                 &handle,
+                 0,
+                 &oa,
+                 NULL,
+                 NULL,
+                 Ext2KjournaldThread,
+                 (PVOID)Vcb);
+
+    if (!NT_SUCCESS(status)) {
+        DEBUG(DL_ERR, ("Ext4Fsd: failed to start kjournald: %xh\n", status));
+        return status;
+    }
+
+    ObReferenceObjectByHandle(handle, THREAD_ALL_ACCESS, NULL, KernelMode,
+                              (PVOID *)&Vcb->KjournaldThread, NULL);
+    ZwClose(handle);
+
+    /* Wait for thread to enter its loop (up to 2s) */
+    timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 2;
+    KeWaitForSingleObject(&Vcb->KjournaldDone, Executive, KernelMode, FALSE, &timeout);
+
+    DEBUG(DL_INF, ("Ext4Fsd: kjournald started (commit interval=%us)\n",
+                   EXT2_COMMIT_INTERVAL_SECONDS));
+    return STATUS_SUCCESS;
+}
+
+VOID
+Ext2StopKjournald(PEXT2_VCB Vcb)
+{
+    LARGE_INTEGER timeout;
+
+    if (!Vcb->KjournaldThread)
+        return;
+
+    Vcb->KjournaldStop = TRUE;
+    KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+
+    /* Wait up to 15s for thread to exit */
+    timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 15;
+    KeWaitForSingleObject(Vcb->KjournaldThread, Executive, KernelMode, FALSE, &timeout);
+
+    ObDereferenceObject(Vcb->KjournaldThread);
+    Vcb->KjournaldThread = NULL;
+
+    DEBUG(DL_INF, ("Ext4Fsd: kjournald stopped\n"));
+}
+
+/*
+ * Force an immediate journal commit for this volume.
+ * Called from fsync / FlushFileBuffers / flush IRP paths.
+ * Wakes kjournald and waits for the commit to complete.
+ */
+NTSTATUS
+Ext2JournalForceCommit(PEXT2_VCB Vcb)
+{
+    journal_t *journal;
+    LARGE_INTEGER timeout;
+
+    if (!Vcb)
+        return STATUS_SUCCESS;
+
+    journal = EXT4_SB(&Vcb->sb)->s_journal;
+    if (!journal)
+        return STATUS_SUCCESS;
+
+    /* If no pending handle, nothing to commit */
+    if (!Vcb->PendingJournalHandle)
+        return STATUS_SUCCESS;
+
+    /* Wake kjournald */
+    KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+
+    /* Wait for commit to finish (up to 30s) */
+    timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 30;
+    KeWaitForSingleObject(&Vcb->KjournaldDone, Executive, KernelMode, FALSE, &timeout);
+
+    return STATUS_SUCCESS;
 }

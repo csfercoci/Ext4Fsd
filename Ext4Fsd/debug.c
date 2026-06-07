@@ -146,7 +146,7 @@ Ext2Printf(
     RtlZeroMemory(Buffer, DBG_BUF_LEN);
     va_start(ap, DebugMessage);
 
-    KeQuerySystemTime( &CurrentTime);
+    KeQuerySystemTimePrecise( &CurrentTime);
     RtlTimeToTimeFields(&CurrentTime, &TimeFields);
     _vsnprintf(&Buffer[0], DBG_BUF_LEN, DebugMessage, ap);
 
@@ -173,7 +173,7 @@ Ext2NiPrintf(
 
     va_start(ap, DebugMessage);
 
-    KeQuerySystemTime( &CurrentTime);
+    KeQuerySystemTimePrecise( &CurrentTime);
     RtlTimeToTimeFields(&CurrentTime, &TimeFields);
     _vsnprintf(&Buffer[0], 0x100, DebugMessage, ap);
 

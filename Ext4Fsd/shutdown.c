@@ -67,7 +67,7 @@ Ext2ShutDown (IN PEXT2_IRP_CONTEXT IrpContext)
                 if (IsMounted(Vcb)) {
 
                     /* update fs write time */
-                    KeQuerySystemTime(&SysTime);
+                    KeQuerySystemTimePrecise(&SysTime);
                     Ext2TimeToSecondsSince1970(&SysTime, &LinuxTime.LowPart, &LinuxTime.HighPart);
                     Vcb->SuperBlock->s_wtime = LinuxTime.LowPart;
                     Vcb->SuperBlock->s_wtime_hi = (UCHAR)LinuxTime.HighPart;
@@ -81,6 +81,9 @@ Ext2ShutDown (IN PEXT2_IRP_CONTEXT IrpContext)
 
                     /* flush volume stream's cache to disk */
                     Ext2FlushVolume(IrpContext, Vcb, TRUE);
+
+                    /* ensure all dirty pinned pages reach disk before shutdown */
+                    CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
 
                     /* send shutdown request to underlying disk */
                     Ext2DiskShutDown(Vcb);

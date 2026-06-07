@@ -1927,6 +1927,7 @@ Ext2CreateVolume(PEXT2_IRP_CONTEXT IrpContext, PEXT2_VCB Vcb)
         if (!IsVcbReadOnly(Vcb)) {
             Ext2FlushFiles(IrpContext, Vcb, FALSE);
             Ext2FlushVolume(IrpContext, Vcb, FALSE);
+            CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
         }
 
         SetLongFlag(Vcb->Flags, VCB_VOLUME_LOCKED);
@@ -1938,6 +1939,7 @@ Ext2CreateVolume(PEXT2_IRP_CONTEXT IrpContext, PEXT2_VCB Vcb)
             if (!IsVcbReadOnly(Vcb)) {
                 Ext2FlushFiles(IrpContext, Vcb, FALSE);
                 Ext2FlushVolume(IrpContext, Vcb, FALSE);
+                CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
             }
         }
     }
@@ -2088,7 +2090,7 @@ Ext2CreateInode(
         goto errorout;
     }
 
-    KeQuerySystemTime(&SysTime);
+    KeQuerySystemTimePrecise(&SysTime);
     Ext2ClearInode(IrpContext, Vcb, iNo);
     Inode.i_sb = &Vcb->sb;
     Inode.i_ino = iNo;
@@ -2170,7 +2172,7 @@ Ext2SupersedeOrOverWriteFile(
     LARGE_INTEGER   CurrentTime;
     LARGE_INTEGER   Size;
 
-    KeQuerySystemTime(&CurrentTime);
+    KeQuerySystemTimePrecise(&CurrentTime);
 
     Size.QuadPart = 0;
     if (!MmCanFileBeTruncated(&(Fcb->SectionObject), &(Size))) {

@@ -522,6 +522,12 @@ typedef struct _EXT2_GLOBAL {
     EXT2_REAPER                 McbReaper;
     EXT2_REAPER                 bhReaper;
 
+    /* Periodic sync thread: commits the deferred journal and flushes dirty
+     * volume metadata to disk every few seconds (the kjournald2 equivalent),
+     * so a crash / power-loss between writes and the next explicit flush only
+     * loses the last sync interval rather than everything since mount. */
+    EXT2_REAPER                 SyncReaper;
+
     /* Look Aside table of IRP_CONTEXT, FCB, MCB, CCB */
     LOOKASIDE_LIST_EX           Ext2IrpContextLookasideList;
     LOOKASIDE_LIST_EX           Ext2FcbLookasideList;
@@ -752,8 +758,16 @@ typedef struct _EXT2_VCB {
     /* Deferred journal commit accumulator.
      * When non-NULL, dirty metadata buffers from closed handles are
      * merged here instead of being committed synchronously.
-     * Flushed by Ext2FlushVcb/Ext2PurgeVolume/Ext2DestroyVcb. */
+     * Flushed by kjournald thread or Ext2JournalFlushPending. */
     void                        *PendingJournalHandle;
+
+    /* kjournald: dedicated journal commit thread per volume.
+     * Commits the pending handle every CommitIntervalSeconds (default 10s)
+     * or on demand when Ext2JournalForceCommit is called (fsync/flush). */
+    PKTHREAD                    KjournaldThread;
+    KEVENT                      KjournaldWake;
+    KEVENT                      KjournaldDone;
+    BOOLEAN                     KjournaldStop;
 
     /* Maximum file size in blocks ... */
     ULONG                       max_blocks_per_layer[EXT2_BLOCK_TYPES];
@@ -1216,6 +1230,17 @@ Ext2ReadSync(
     IN ULONG            Length,
     OUT PVOID           Buffer,
     IN BOOLEAN          bVerify );
+
+NTSTATUS
+Ext2WriteSync(
+    IN PEXT2_VCB        Vcb,
+    IN ULONGLONG        Offset,
+    IN ULONG            Length,
+    IN PVOID            Buffer );
+
+NTSTATUS
+Ext2FlushDiskCache(
+    IN PEXT2_VCB        Vcb );
 
 NTSTATUS
 Ext2ReadDisk(
@@ -2621,6 +2646,20 @@ VOID
 Ext2bhReaperThread(
     PVOID   Context
 );
+
+VOID
+Ext2SyncReaperThread(
+    PVOID   Context
+);
+
+NTSTATUS
+Ext2StartKjournald(PEXT2_VCB Vcb);
+
+VOID
+Ext2StopKjournald(PEXT2_VCB Vcb);
+
+NTSTATUS
+Ext2JournalForceCommit(PEXT2_VCB Vcb);
 
 
 PEXT2_IRP_CONTEXT

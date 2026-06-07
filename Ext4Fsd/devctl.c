@@ -473,6 +473,7 @@ Ext2ProcessVolumeProperty(
                 if (IsFlagOn(Vcb->Flags, VCB_INITIALIZED)) {
                     Ext2FlushFiles(NULL, Vcb, FALSE);
                     Ext2FlushVolume(NULL, Vcb, FALSE);
+                    CcFlushCache(&Vcb->SectionObject, NULL, 0, NULL);
                 }
                 SetLongFlag(Vcb->Flags, VCB_READ_ONLY);
 

@@ -125,7 +125,7 @@ Ext2Close (IN PEXT2_IRP_CONTEXT IrpContext)
             IsFileDeleted(Fcb->Mcb)) {
             Fcb->TsDrop.QuadPart = 0;
         } else {
-            KeQuerySystemTime(&Fcb->TsDrop);
+            KeQuerySystemTimePrecise(&Fcb->TsDrop);
         }
         Ext2DerefXcb(&Vcb->ReferenceCount);
 

@@ -65,9 +65,12 @@ DriverUnload (IN PDRIVER_OBJECT DriverObject)
     DEBUG(DL_FUN, ( "Ext2Fsd: Unloading routine.\n"));
 
     /*
-     *  stop reaper thread ...
+     *  stop reaper threads before tearing down Ext2Global (they reference it)
      */
-
+    Ext2StopReaper(&Ext2Global->SyncReaper);
+    Ext2StopReaper(&Ext2Global->bhReaper);
+    Ext2StopReaper(&Ext2Global->McbReaper);
+    Ext2StopReaper(&Ext2Global->FcbReaper);
 
     /*
      *  removing memory allocations and  objects
@@ -75,6 +78,11 @@ DriverUnload (IN PDRIVER_OBJECT DriverObject)
 
     RtlInitUnicodeString(&DosDeviceName, DOS_DEVICE_NAME);
     IoDeleteSymbolicLink(&DosDeviceName);
+
+    /* balance IoRegisterShutdownNotification() from DriverEntry */
+    if (Ext2Global->DiskdevObject) {
+        IoUnregisterShutdownNotification(Ext2Global->DiskdevObject);
+    }
 
     Ext2UnloadAllNls();
 
@@ -454,6 +462,10 @@ DriverEntry (
     int                         rc = 0;
     BOOLEAN                     linux_lib_inited = FALSE;
     BOOLEAN                     journal_module_inited = FALSE;
+    BOOLEAN                     fcbReaperStarted = FALSE;
+    BOOLEAN                     mcbReaperStarted = FALSE;
+    BOOLEAN                     bhReaperStarted  = FALSE;
+    BOOLEAN                     syncReaperStarted = FALSE;
 
     /* Verity super block ... */
     ASSERT(sizeof(EXT2_SUPER_BLOCK) == 1024);
@@ -547,6 +559,7 @@ DriverEntry (
     if (!NT_SUCCESS(Status)) {
         goto errorout;
     }
+    fcbReaperStarted = TRUE;
 
     /* start resource reaper thread */
     Status= Ext2StartReaper(
@@ -556,6 +569,7 @@ DriverEntry (
         Ext2StopReaper(&Ext2Global->FcbReaper);
         goto errorout;
     }
+    mcbReaperStarted = TRUE;
 
     Status= Ext2StartReaper(
                 &Ext2Global->bhReaper,
@@ -565,6 +579,19 @@ DriverEntry (
         Ext2StopReaper(&Ext2Global->McbReaper);
         goto errorout;
     }
+    bhReaperStarted = TRUE;
+
+    /* start periodic sync thread (commits journal + flushes metadata) */
+    Status= Ext2StartReaper(
+                &Ext2Global->SyncReaper,
+                Ext2SyncReaperThread);
+    if (!NT_SUCCESS(Status)) {
+        Ext2StopReaper(&Ext2Global->FcbReaper);
+        Ext2StopReaper(&Ext2Global->McbReaper);
+        Ext2StopReaper(&Ext2Global->bhReaper);
+        goto errorout;
+    }
+    syncReaperStarted = TRUE;
 
 #ifdef _PNP_POWER_
     DiskdevObject->DeviceObjectExtension->PowerControlNeeded = FALSE;
@@ -786,14 +813,37 @@ DriverEntry (
     IoRegisterFileSystem(CdromdevObject);
     ObReferenceObject(CdromdevObject);
 
+    /*
+     * Register for system shutdown notification.  Without this the I/O
+     * manager never delivers IRP_MJ_SHUTDOWN, so Ext2ShutDown() (which flushes
+     * every mounted volume's dirty metadata to disk via Ext2FlushVolume) never
+     * runs at restart -- causing all unflushed metadata to be lost on reboot.
+     */
+    Status = IoRegisterShutdownNotification(DiskdevObject);
+    if (!NT_SUCCESS(Status)) {
+        DEBUG(DL_ERR, ( "IoRegisterShutdownNotification failed: %xh\n", Status));
+        goto errorout;
+    }
+
 errorout:
 
     if (!NT_SUCCESS(Status)) {
 
         /*
-         *  stop reaper thread ...
+         *  stop reaper threads (the ones that were successfully started)
          */
-
+        if (syncReaperStarted) {
+            Ext2StopReaper(&Ext2Global->SyncReaper);
+        }
+        if (bhReaperStarted) {
+            Ext2StopReaper(&Ext2Global->bhReaper);
+        }
+        if (mcbReaperStarted) {
+            Ext2StopReaper(&Ext2Global->McbReaper);
+        }
+        if (fcbReaperStarted) {
+            Ext2StopReaper(&Ext2Global->FcbReaper);
+        }
 
         /*
          *  cleanup resources ...

@@ -2669,6 +2669,9 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
             }
             /* finish unfinished deletes left in the orphan list */
             Ext2ProcessOrphanList(IrpContext, Vcb);
+
+            /* Start kjournald for async journal commits */
+            Ext2StartKjournald(Vcb);
         }
 
         /* Now allocating the mcb for root ... */
@@ -2824,6 +2827,9 @@ Ext2DestroyVcb (IN PEXT2_VCB Vcb)
     if (Vcb->sbi.s_journal) {
         journal_t *journal = Vcb->sbi.s_journal;
         PEXT2_MCB  jcb = (PEXT2_MCB)Vcb->sbi.s_journal_mcb;
+
+        /* Stop kjournald before flushing */
+        Ext2StopKjournald(Vcb);
 
         /* Commit any deferred pending journal before tearing down. */
         Ext2JournalFlushPending(Vcb);
@@ -3292,6 +3298,93 @@ Ext2bhReaperThread(
                 ASSERT(0 == atomic_read(&bh->b_count));
                 free_buffer_head(bh);
             }
+        }
+
+    } __finally {
+
+        if (GlobalAcquired) {
+            ExReleaseResourceLite(&Ext2Global->Resource);
+        }
+
+        KeSetEvent(&Reaper->Engine, 0, FALSE);
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+/*
+ * Periodic sync thread (kjournald2 equivalent).
+ *
+ * Wakes every few seconds and, for every mounted writable volume, commits the
+ * deferred pending journal handle and flushes dirty metadata to disk via
+ * Ext2FlushVcb.  Without this, metadata accumulated since the last explicit
+ * flush only reaches disk at a clean shutdown -- so an application fault,
+ * kernel bugcheck or power loss in between would lose it.  This bounds the
+ * crash window to the sync interval below.
+ */
+#define EXT2_SYNC_INTERVAL_SECONDS  30
+
+VOID
+Ext2SyncReaperThread(
+    PVOID   Context
+)
+{
+    PEXT2_REAPER    Reaper = Context;
+    PEXT2_VCB       Vcb = NULL;
+    PLIST_ENTRY     Link;
+    LARGE_INTEGER   Timeout;
+
+    BOOLEAN         GlobalAcquired = FALSE;
+
+    __try {
+
+        Reaper->Thread = PsGetCurrentThread();
+
+        /* wake up DriverEntry */
+        KeSetEvent(&Reaper->Engine, 0, FALSE);
+
+        while (!IsFlagOn(Reaper->Flags, EXT2_REAPER_FLAG_STOP)) {
+
+            /* wait until woken (KeSetEvent on Wait) or the interval elapses */
+            Timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * EXT2_SYNC_INTERVAL_SECONDS;
+            KeWaitForSingleObject(
+                &Reaper->Wait,
+                Executive,
+                KernelMode,
+                FALSE,
+                &Timeout
+            );
+
+            if (IsFlagOn(Reaper->Flags, EXT2_REAPER_FLAG_STOP))
+                break;
+
+            /* hold the global lock shared while walking the mounted list */
+            ExAcquireResourceSharedLite(&Ext2Global->Resource, TRUE);
+            GlobalAcquired = TRUE;
+
+            for (Link = Ext2Global->VcbList.Flink;
+                 Link != &(Ext2Global->VcbList);
+                 Link = Link->Flink ) {
+
+                Vcb = CONTAINING_RECORD(Link, EXT2_VCB, Next);
+
+                if (!IsMounted(Vcb) || IsVcbReadOnly(Vcb))
+                    continue;
+                if (!IsFlagOn(Vcb->Flags, VCB_INITIALIZED))
+                    continue;
+
+                if (ExAcquireResourceExclusiveLite(&Vcb->MainResource, FALSE)) {
+                    __try {
+                        Ext2FlushVcb(Vcb);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        /* never let one volume's flush kill the sync thread */
+                    }
+                    ExReleaseResourceLite(&Vcb->MainResource);
+                }
+            }
+
+            ExReleaseResourceLite(&Ext2Global->Resource);
+            GlobalAcquired = FALSE;
         }
 
     } __finally {
