@@ -23,12 +23,13 @@ jobs:
         $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
         $vsix = Join-Path $wdkRoot "Vsix\WDK.vsix"
         if (!(Test-Path $vsix)) {
-          $vsix = Get-ChildItem -Path $wdkRoot -Filter "WDK.vsix" -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+          $vsix = Get-ChildItem -Path $wdkRoot -Filter "WDK.vsix" -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
         }
         if (-not $vsix -or !(Test-Path $vsix)) {
           throw "WDK VSIX not found under $wdkRoot"
         }
+        # VSWHERE_PATH is an optional override; otherwise use the standard install locations.
         $vswhere = $env:VSWHERE_PATH
         if (-not $vswhere -or !(Test-Path $vswhere)) {
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
