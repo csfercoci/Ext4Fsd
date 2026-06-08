@@ -20,10 +20,17 @@ jobs:
     - name: Install WDK
       shell: pwsh
       run: |
-        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2306896"
-        $wdkExe = "$env:TEMP\wdksetup.exe"
-        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe
-        Start-Process -FilePath $wdkExe -ArgumentList "/q", "/norestart", "/features", "+" -Wait -NoNewWindow
+        # windows-latest runners already have WDK installed; skip if present
+        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        if (Test-Path "$wdkRoot\Include\10.0.26100.0") {
+          Write-Host "WDK 10.0.26100.0 already installed, skipping download."
+        } else {
+          Write-Host "WDK not found, installing..."
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2306896"
+          $wdkExe = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe
+          Start-Process -FilePath $wdkExe -ArgumentList "/q", "/norestart", "/features", "+" -Wait -NoNewWindow
+        }
 
     - name: Build driver (Release|x64)
       run: msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /t:Build
