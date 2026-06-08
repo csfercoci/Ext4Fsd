@@ -29,7 +29,17 @@ jobs:
         if (-not $vsix -or !(Test-Path $vsix)) {
           throw "WDK VSIX not found under $wdkRoot"
         }
-        $vsInstallPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath
+        $vswhere = $env:VSWHERE_PATH
+        if (-not $vswhere -or !(Test-Path $vswhere)) {
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        }
+        if (!(Test-Path $vswhere)) {
+          $vswhere = "${env:ProgramFiles}\Microsoft Visual Studio\Installer\vswhere.exe"
+        }
+        if (!(Test-Path $vswhere)) {
+          throw "vswhere.exe not found."
+        }
+        $vsInstallPath = & $vswhere -products * -latest -property installationPath
         if (-not $vsInstallPath) {
           throw "Visual Studio installation path not found."
         }
