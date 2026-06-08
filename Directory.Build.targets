@@ -1,0 +1,23 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    GitHub Actions runners may lack the x64 WDK kernel toolset
+    (WindowsKernelModeDriver10.0) for the runner's VS version.
+    When the toolset is missing, KM_IncludePath is never set and
+    ntifs.h is not found.  This targets file injects the WDK
+    km/shared include paths into AdditionalIncludeDirectories
+    as a last-resort fallback, evaluated AFTER the import chain.
+  -->
+  <PropertyGroup Condition="'$(KM_IncludePath)' == ''">
+    <_WdkRoot>$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</_WdkRoot>
+    <_WdkRoot Condition="!HasTrailingSlash('$(_WdkRoot)')">$(_WdkRoot)\</_WdkRoot>
+    <_WdkVersion Condition="'$(WindowsTargetPlatformVersion)' != ''">$(WindowsTargetPlatformVersion)</_WdkVersion>
+    <_WdkVersion Condition="'$(WindowsTargetPlatformVersion)' == ''">10.0.26100.0</_WdkVersion>
+    <_WdkKm>$(_WdkRoot)Include\$(_WdkVersion)\km</_WdkKm>
+    <_WdkShared>$(_WdkRoot)Include\$(_WdkVersion)\shared</_WdkShared>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(KM_IncludePath)' == '' and Exists('$(_WdkKm)')">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>
