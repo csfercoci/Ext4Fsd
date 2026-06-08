@@ -7,7 +7,12 @@
     km/shared include paths into AdditionalIncludeDirectories
     as a last-resort fallback, evaluated AFTER the import chain.
   -->
-  <PropertyGroup Condition="'$(KM_IncludePath)' == ''">
+  <!--
+    When the WDK kernel toolset (WindowsKernelModeDriver10.0) is missing
+    for x64, IncludePath doesn't contain the km/shared dirs.  Detect this
+    by checking if ntifs.h is reachable, and if not, inject the paths.
+  -->
+  <PropertyGroup Condition="!Exists('$(VC_IncludePath)\ntifs.h')">
     <_WdkRoot>$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</_WdkRoot>
     <_WdkRoot Condition="!HasTrailingSlash('$(_WdkRoot)')">$(_WdkRoot)\</_WdkRoot>
     <_WdkVersion Condition="'$(WindowsTargetPlatformVersion)' != ''">$(WindowsTargetPlatformVersion)</_WdkVersion>
@@ -15,7 +20,7 @@
     <_WdkKm>$(_WdkRoot)Include\$(_WdkVersion)\km</_WdkKm>
     <_WdkShared>$(_WdkRoot)Include\$(_WdkVersion)\shared</_WdkShared>
   </PropertyGroup>
-  <ItemDefinitionGroup Condition="'$(KM_IncludePath)' == '' and Exists('$(_WdkKm)')">
+  <ItemDefinitionGroup Condition="!Exists('$(VC_IncludePath)\ntifs.h') and Exists('$(_WdkKm)')">
     <ClCompile>
       <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
