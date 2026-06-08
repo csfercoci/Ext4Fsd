@@ -17,23 +17,32 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
-    - name: Install WDK
+    - name: Register WDK VSIX
       shell: pwsh
       run: |
-        # Download and install WDK (registers the VS extension automatically)
-        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2306896"
-        $wdkExe = "$env:TEMP\wdksetup.exe"
-        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe
-        Start-Process -FilePath $wdkExe -ArgumentList "/q", "/norestart", "/features", "+" -Wait -NoNewWindow
-        # Register the WDK VS extension (VSIX) with the installed VS
-        $vsix = "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\WDK.vsix"
-        if (Test-Path $vsix) {
-          Write-Host "Registering WDK VSIX: $vsix"
-          & "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe" /quiet $vsix
-          Write-Host "WDK VSIX registered."
-        } else {
-          Write-Host "WDK VSIX not found at $vsix"
+        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        $vsix = Join-Path $wdkRoot "Vsix\WDK.vsix"
+        if (!(Test-Path $vsix)) {
+          $vsix = Get-ChildItem -Path $wdkRoot -Filter "WDK.vsix" -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
         }
+        if (-not $vsix -or !(Test-Path $vsix)) {
+          throw "WDK VSIX not found under $wdkRoot"
+        }
+        $vsInstallPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath
+        if (-not $vsInstallPath) {
+          throw "Visual Studio installation path not found."
+        }
+        $vsixInstaller = Join-Path $vsInstallPath "Common7\IDE\VSIXInstaller.exe"
+        if (!(Test-Path $vsixInstaller)) {
+          throw "VSIXInstaller.exe not found at $vsixInstaller"
+        }
+        Write-Host "Registering WDK VSIX: $vsix"
+        & $vsixInstaller /quiet $vsix
+        if ($LASTEXITCODE -ne 0) {
+          throw "VSIXInstaller.exe failed with exit code $LASTEXITCODE"
+        }
+        Write-Host "WDK VSIX registered."
 
     - name: Build driver (Release|x64)
       run: msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /m
