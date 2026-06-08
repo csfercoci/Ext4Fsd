@@ -40,13 +40,11 @@ jobs:
           throw "VSIXInstaller.exe not found at $vsixInstaller"
         }
 
-        # Skip VSIX registration when the kernel toolset is already available.
-        $toolset = Get-ChildItem -Path (Join-Path $vsInstallPath "MSBuild") `
-                                 -Directory -Filter "WindowsKernelModeDriver10.0" `
-                                 -Recurse -ErrorAction SilentlyContinue |
-                   Select-Object -First 1 -ExpandProperty FullName
-        if ($toolset) {
-          Write-Host "WDK toolset already available at: $toolset"
+        # Check specifically for x64 kernel toolset (ARM64 may exist alone).
+        $x64toolset = Join-Path $vsInstallPath "MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0"
+        $x64toolset180 = Join-Path $vsInstallPath "MSBuild\Microsoft\VC\v180\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0"
+        if ((Test-Path $x64toolset) -or (Test-Path $x64toolset180)) {
+          Write-Host "x64 WDK kernel toolset found."
           return
         }
 
