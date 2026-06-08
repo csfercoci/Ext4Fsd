@@ -1,0 +1,25 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    GitHub Actions runners have WDK headers installed but may lack the
+    WindowsKernelModeDriver10.0 VS extension (the VSIX).  Without it,
+    MSBuild doesn't resolve KM_IncludePath and ntifs.h is not found.
+
+    This file injects the WDK km/shared include paths into the driver
+    project's AdditionalIncludeDirectories when the toolset hasn't
+    already done so.  Local builds with the VS extension installed are
+    unaffected (KM_IncludePath is already set by the toolset chain).
+  -->
+  <PropertyGroup Condition="'$(KM_IncludePath)' == '' and Exists('$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)')">
+    <_WdkRoot>$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</_WdkRoot>
+    <_WdkRoot Condition="!HasTrailingSlash('$(_WdkRoot)')">$(_WdkRoot)\</_WdkRoot>
+    <_WdkVersion Condition="'$(WindowsTargetPlatformVersion)' != ''">$(WindowsTargetPlatformVersion)</_WdkVersion>
+    <_WdkVersion Condition="'$(WindowsTargetPlatformVersion)' == ''">10.0.26100.0</_WdkVersion>
+    <_WdkKm>$(_WdkRoot)Include\$(_WdkVersion)\km</_WdkKm>
+    <_WdkShared>$(_WdkRoot)Include\$(_WdkVersion)\shared</_WdkShared>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="Exists('$(_WdkKm)')">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>
