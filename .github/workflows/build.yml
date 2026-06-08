@@ -71,7 +71,30 @@ jobs:
         Write-Host "WDK VSIX registered."
 
     - name: Build driver (Release|x64)
-      run: msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /m
+      shell: pwsh
+      run: |
+        # On GitHub Actions, the WDK kernel toolset may be registered only
+        # for ARM64 but not x64 under the runner's VS version (v180).
+        # When the toolset is missing, MSBuild doesn't set KM_IncludePath
+        # and ntifs.h is not found.  Detect the WDK include directory and
+        # pass it directly via AdditionalIncludeDirectories.
+        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        $wdkVersions = @("10.0.26100.0", "10.0.28000.0", "10.0.22621.0", "10.0.19041.0")
+        $extraInc = ""
+        foreach ($ver in $wdkVersions) {
+          $km = Join-Path $wdkRoot "Include\$ver\km"
+          if (Test-Path $km) {
+            $shared = Join-Path $wdkRoot "Include\$ver\shared"
+            $extraInc = "$km;$shared"
+            Write-Host "WDK include: $km"
+            break
+          }
+        }
+        $msbuildArgs = @("Ext4Fsd.sln", "/p:Configuration=Release", "/p:Platform=x64", "/p:SpectreMitigation=false", "/m")
+        if ($extraInc) {
+          $msbuildArgs += "/p:AdditionalIncludeDirectories=`"$extraInc;%(AdditionalIncludeDirectories)`""
+        }
+        & msbuild @msbuildArgs
 
     - name: Install NSIS
       uses: joncloud/makensis-action@v4
