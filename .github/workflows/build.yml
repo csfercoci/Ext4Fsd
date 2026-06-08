@@ -77,22 +77,25 @@ jobs:
         # for ARM64 but not x64 under the runner's VS version (v180).
         # When the toolset is missing, MSBuild doesn't set KM_IncludePath
         # and ntifs.h is not found.  Detect the WDK include directory and
-        # pass it directly via AdditionalIncludeDirectories.
+        # set KM_IncludePath + KIT_SHARED_IncludePath as MSBuild properties
+        # so the WDK.KernelMode.props IncludePath is correctly resolved.
         $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
         $wdkVersions = @("10.0.26100.0", "10.0.28000.0", "10.0.22621.0", "10.0.19041.0")
-        $extraInc = ""
+        $kmPath = ""
+        $sharedPath = ""
         foreach ($ver in $wdkVersions) {
           $km = Join-Path $wdkRoot "Include\$ver\km"
           if (Test-Path $km) {
-            $shared = Join-Path $wdkRoot "Include\$ver\shared"
-            $extraInc = "$km;$shared"
+            $kmPath = $km
+            $sharedPath = Join-Path $wdkRoot "Include\$ver\shared"
             Write-Host "WDK include: $km"
             break
           }
         }
         $msbuildArgs = @("Ext4Fsd.sln", "/p:Configuration=Release", "/p:Platform=x64", "/p:SpectreMitigation=false", "/m")
-        if ($extraInc) {
-          $msbuildArgs += "/p:AdditionalIncludeDirectories=`"$extraInc;%(AdditionalIncludeDirectories)`""
+        if ($kmPath) {
+          $msbuildArgs += "/p:KM_IncludePath=$kmPath"
+          $msbuildArgs += "/p:KIT_SHARED_IncludePath=$sharedPath"
         }
         & msbuild @msbuildArgs
 
