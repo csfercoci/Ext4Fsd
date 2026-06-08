@@ -20,19 +20,27 @@ jobs:
     - name: Install WDK
       shell: pwsh
       run: |
-        # Download and install WDK (registers the VS extension automatically)
-        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2306896"
-        $wdkExe = "$env:TEMP\wdksetup.exe"
-        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe
-        Start-Process -FilePath $wdkExe -ArgumentList "/q", "/norestart", "/features", "+" -Wait -NoNewWindow
-        # Register the WDK VS extension (VSIX) with the installed VS
-        $vsix = "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\WDK.vsix"
-        if (Test-Path $vsix) {
-          Write-Host "Registering WDK VSIX: $vsix"
-          & "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe" /quiet $vsix
-          Write-Host "WDK VSIX registered."
+        # windows-latest runners already have WDK installed; find the VSIX
+        # and register it with the runner's Visual Studio instance.
+        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        $vsix = Join-Path $wdkRoot "Vsix\WDK.vsix"
+        if (-not (Test-Path $vsix)) {
+          # Try alternative locations
+          $vsix = Get-ChildItem -Path $wdkRoot -Filter "WDK.vsix" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+        }
+        if ($vsix -and (Test-Path $vsix)) {
+          Write-Host "Found WDK VSIX: $vsix"
+          # Find VSIXInstaller.exe for the runner's VS version
+          $installer = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" -Filter "VSIXInstaller.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          if ($installer) {
+            Write-Host "Registering WDK VSIX with $installer"
+            & $installer /quiet $vsix
+            Write-Host "WDK VSIX registered."
+          } else {
+            Write-Host "VSIXInstaller.exe not found."
+          }
         } else {
-          Write-Host "WDK VSIX not found at $vsix"
+          Write-Host "WDK VSIX not found; WDK headers should still be available via registry."
         }
 
     - name: Build driver (Release|x64)
