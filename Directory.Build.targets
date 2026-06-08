@@ -15,6 +15,7 @@
     On local builds with the toolset registered, this is a no-op because
     the paths are already in IncludePath.
   -->
+  <Message Importance="high" Text="Directory.Build.targets loaded. KitsRoot10=[$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)] WindowsTargetPlatformVersion=[$(WindowsTargetPlatformVersion)]" />
   <PropertyGroup>
     <_WdkRoot>$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</_WdkRoot>
     <_WdkRoot Condition="!HasTrailingSlash('$(_WdkRoot)')">$(_WdkRoot)\</_WdkRoot>
@@ -23,6 +24,7 @@
     <_WdkKm>$(_WdkRoot)Include\$(_WdkVersion)\km</_WdkKm>
     <_WdkShared>$(_WdkRoot)Include\$(_WdkVersion)\shared</_WdkShared>
   </PropertyGroup>
+  <Message Importance="high" Text="WDK include check: _WdkKm=$(_WdkKm) Exists=$([System.IO.Directory]::Exists('$(_WdkKm)'))" />
   <ItemDefinitionGroup Condition="Exists('$(_WdkKm)')">
     <ClCompile>
       <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
