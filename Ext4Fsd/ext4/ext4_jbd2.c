@@ -372,6 +372,24 @@ out_release:
     return err;
 }
 
+/*
+ * Drop the buffer_head references this handle pinned in
+ * __ext4_handle_dirty_metadata (one get_bh per tracked buffer).
+ *
+ * Call AFTER the handle's buffers have been committed (or when discarding
+ * an uncommitted handle), and NEVER while holding j_checkpoint_mutex:
+ * put_bh -> __brelse acquires bd_bh_lock and may issue I/O.
+ */
+static void ext4_handle_release_buffers(struct ext4_handle *eh)
+{
+    int i;
+    for (i = 0; i < eh->nbuffers; i++) {
+        if (eh->buffers[i])
+            put_bh(eh->buffers[i]);
+    }
+    eh->nbuffers = 0;
+}
+
 /* ==================== Public API ==================== */
 
 static void Ext2FlushDirtyData(PEXT2_VCB Vcb);
@@ -451,6 +469,19 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
         mutex_lock(&journal->j_checkpoint_mutex);
         pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
 
+        /* Defensive ownership check: this handle is ALREADY the pending
+         * handle.  That means __ext4_journal_stop reached the same eh twice
+         * (double-stop / aliased IrpContext->Handle).  Merging or freeing it
+         * here would leave Vcb->PendingJournalHandle pointing at freed heap,
+         * and kjournald would free it a second time -> Ext2FreePool guard
+         * corruption -> int 3 (BSOD 0x7E).  The handle is already owned by
+         * the pending slot; drop this redundant stop and let kjournald
+         * commit/free it exactly once. */
+        if (pending == eh) {
+            mutex_unlock(&journal->j_checkpoint_mutex);
+            return 0;
+        }
+
         if (pending == NULL) {
             /* Become the pending handle -- don't commit yet. */
             Vcb->PendingJournalHandle = (void *)eh;
@@ -467,7 +498,9 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
         if ((pending->nbuffers + eh->nbuffers) <= MAX_HANDLE_BUFFERS &&
             (pending->nrevoked + eh->nrevoked) <= MAX_HANDLE_REVOKES) {
 
-            /* Merge buffers (deduplicated) */
+            /* Merge buffers (deduplicated).  Each eh buffer carries one
+             * get_bh reference: transfer it to pending for non-duplicates,
+             * release it for duplicates (pending already holds a ref). */
             for (i = 0; i < eh->nbuffers; i++) {
                 int dup = 0;
                 for (j = 0; j < pending->nbuffers; j++) {
@@ -478,7 +511,11 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
                 }
                 if (!dup)
                     pending->buffers[pending->nbuffers++] = eh->buffers[i];
+                else
+                    put_bh(eh->buffers[i]);
             }
+            /* References handled above; don't double-release on free. */
+            eh->nbuffers = 0;
 
             /* Merge revokes */
             for (i = 0; i < eh->nrevoked; i++)
@@ -490,23 +527,25 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
             return 0;
         }
 
-        /* Pending handle full -- commit the old one synchronously, then
-         * become the new pending.  We must NULL the pointer BEFORE kfree
-         * so that kjournald (woken by batch timer/force-commit) never sees
-         * a dangling pointer into freed heap.
+        /* Pending handle full -- swap eh in as the new pending atomically
+         * (single critical section) and commit the evicted one.  eh is a
+         * fully-formed, finished handle (h_ref == 0), so it's safe for
+         * kjournald to grab and commit it immediately if woken.
+         *
+         * Splitting this into "NULL out, unlock, ... , lock, install eh"
+         * leaves a window where another __ext4_journal_stop can claim the
+         * NULL slot; this swap then clobbers that handle, leaking it and
+         * silently dropping its journal entries (corruption).
          *
          * Data=ordered: flush dirty file data before committing metadata
          * so that data blocks are on disk before metadata references them. */
-        Vcb->PendingJournalHandle = NULL;
+        Vcb->PendingJournalHandle = (void *)eh;
         mutex_unlock(&journal->j_checkpoint_mutex);
 
         Ext2FlushDirtyData(Vcb);
         err = journal_commit_sync(pending);
+        ext4_handle_release_buffers(pending);
         kfree(pending);
-
-        mutex_lock(&journal->j_checkpoint_mutex);
-        Vcb->PendingJournalHandle = (void *)eh;
-        mutex_unlock(&journal->j_checkpoint_mutex);
 
         /* Arm batch timer for the new pending handle */
         if (Vcb->KjournaldThread && !Vcb->BatchTimerArmed) {
@@ -520,6 +559,7 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
 
     /* No VCB context -- commit immediately (safety fallback). */
     err = journal_commit_sync(eh);
+    ext4_handle_release_buffers(eh);
     kfree(eh);
     return err;
 }
@@ -580,6 +620,13 @@ int __ext4_handle_dirty_metadata(const char *where, unsigned int line,
         return -ENOSPC;
     }
 
+    /* Pin the buffer: deferred/pending handles outlive the caller's own
+     * reference, which is dropped by brelse() right after this call.  Without
+     * this get_bh the buffer's b_count can fall to 0, letting the bh reaper
+     * free it before kjournald/overflow/flush commits the handle -- a
+     * use-after-free in journal_commit_sync (reads bh->b_data / b_blocknr).
+     * Released by ext4_handle_release_buffers() after commit. */
+    get_bh(bh);
     eh->buffers[eh->nbuffers++] = bh;
     extents_mark_buffer_dirty(bh);
     return 0;
@@ -683,6 +730,7 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
         /* Data=ordered: flush file data before metadata commit */
         Ext2FlushDirtyData(Vcb);
         journal_commit_sync(pending);
+        ext4_handle_release_buffers(pending);
         kfree(pending);
     }
 }
@@ -756,6 +804,7 @@ Ext2KjournaldThread(PVOID Context)
             /* Data=ordered: flush file data before metadata commit */
             Ext2FlushDirtyData(Vcb);
             journal_commit_sync(pending);
+            ext4_handle_release_buffers(pending);
             kfree(pending);
         }
 
@@ -860,9 +909,15 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     if (!journal)
         return STATUS_SUCCESS;
 
-    /* If no pending handle, nothing to commit */
-    if (!Vcb->PendingJournalHandle)
+    /* If no pending handle, nothing to commit.  Read under the checkpoint
+     * mutex so we observe a consistent view of the slot rather than racing
+     * a concurrent swap in __ext4_journal_stop / kjournald. */
+    mutex_lock(&journal->j_checkpoint_mutex);
+    if (!Vcb->PendingJournalHandle) {
+        mutex_unlock(&journal->j_checkpoint_mutex);
         return STATUS_SUCCESS;
+    }
+    mutex_unlock(&journal->j_checkpoint_mutex);
 
     /* Cancel batch timer — we're committing now */
     KeCancelTimer(&Vcb->BatchTimer);
