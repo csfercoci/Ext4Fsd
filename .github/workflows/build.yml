@@ -20,16 +20,6 @@ jobs:
     - name: Register WDK VSIX
       shell: pwsh
       run: |
-        $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-        $vsix = Join-Path $wdkRoot "Vsix\WDK.vsix"
-        if (!(Test-Path $vsix)) {
-          $vsixSearchRoot = Join-Path $wdkRoot "Vsix"
-          $vsix = Get-ChildItem -Path $vsixSearchRoot -Filter "WDK.vsix" -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-            Select-Object -First 1 -ExpandProperty FullName
-        }
-        if (-not $vsix -or !(Test-Path $vsix)) {
-          throw "WDK VSIX not found under $wdkRoot"
-        }
         # VSWHERE_PATH is an optional override; otherwise use the standard install locations.
         $vswhere = $env:VSWHERE_PATH
         if (-not $vswhere -or !(Test-Path $vswhere)) {
@@ -49,6 +39,32 @@ jobs:
         if (!(Test-Path $vsixInstaller)) {
           throw "VSIXInstaller.exe not found at $vsixInstaller"
         }
+
+        # Skip VSIX registration when the kernel toolset is already available.
+        $toolset = Get-ChildItem -Path (Join-Path $vsInstallPath "MSBuild") `
+                                 -Directory -Filter "WindowsKernelModeDriver10.0" `
+                                 -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+        if ($toolset) {
+          Write-Host "WDK toolset already available at: $toolset"
+          return
+        }
+
+        $vsixRoots = @(
+          "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix",
+          "${env:ProgramFiles}\Windows Kits\10\Vsix"
+        ) | Where-Object { Test-Path $_ }
+
+        $vsix = $null
+        foreach ($root in $vsixRoots) {
+          $vsix = Get-ChildItem -Path $root -Filter "WDK.vsix" -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ($vsix) { break }
+        }
+        if (-not $vsix -or !(Test-Path $vsix)) {
+          throw "WDK toolset missing and WDK.vsix not found under: $($vsixRoots -join ', ')"
+        }
+
         Write-Host "Registering WDK VSIX: $vsix"
         & $vsixInstaller /quiet $vsix
         if ($LASTEXITCODE -ne 0) {
