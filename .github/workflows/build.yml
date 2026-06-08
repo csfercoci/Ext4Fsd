@@ -20,28 +20,19 @@ jobs:
     - name: Install WDK
       shell: pwsh
       run: |
-        # windows-latest runners already have WDK installed; find the VSIX
-        # and register it with the runner's Visual Studio instance.
+        # windows-latest runners already have WDK installed; just verify
         $wdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
-        $vsix = Join-Path $wdkRoot "Vsix\WDK.vsix"
-        if (-not (Test-Path $vsix)) {
-          # Try alternative locations
-          $vsix = Get-ChildItem -Path $wdkRoot -Filter "WDK.vsix" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-        }
-        if ($vsix -and (Test-Path $vsix)) {
-          Write-Host "Found WDK VSIX: $vsix"
-          # Find VSIXInstaller.exe for the runner's VS version
-          $installer = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" -Filter "VSIXInstaller.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-          if ($installer) {
-            Write-Host "Registering WDK VSIX with $installer"
-            & $installer /quiet $vsix
-            Write-Host "WDK VSIX registered."
-          } else {
-            Write-Host "VSIXInstaller.exe not found."
-          }
+        if (Test-Path "$wdkRoot\Include\10.0.26100.0") {
+          Write-Host "WDK 10.0.26100.0 already installed."
         } else {
-          Write-Host "WDK VSIX not found; WDK headers should still be available via registry."
+          Write-Host "WDK not found; attempting download..."
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2306896"
+          $wdkExe = "$env:TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkExe
+          Start-Process -FilePath $wdkExe -ArgumentList "/q", "/norestart", "/features", "+" -Wait -NoNewWindow
         }
+        # Directory.Build.props at repo root handles WDK include paths
+        # when the PlatformToolset extension is missing.
 
     - name: Build driver (Release|x64)
       run: msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /m
