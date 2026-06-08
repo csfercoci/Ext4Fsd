@@ -9,10 +9,13 @@
   -->
   <!--
     When the WDK kernel toolset (WindowsKernelModeDriver10.0) is missing
-    for x64, IncludePath doesn't contain the km/shared dirs.  Detect this
-    by checking if ntifs.h is reachable, and if not, inject the paths.
+    for x64, IncludePath doesn't contain the km/shared dirs and ntifs.h
+    is not found.  Always inject WDK include paths from the registry
+    when the KitsRoot10 key exists and the km directory is present.
+    On local builds with the toolset registered, this is a no-op because
+    the paths are already in IncludePath.
   -->
-  <PropertyGroup Condition="!Exists('$(VC_IncludePath)\ntifs.h')">
+  <PropertyGroup>
     <_WdkRoot>$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</_WdkRoot>
     <_WdkRoot Condition="!HasTrailingSlash('$(_WdkRoot)')">$(_WdkRoot)\</_WdkRoot>
     <_WdkVersion Condition="'$(WindowsTargetPlatformVersion)' != ''">$(WindowsTargetPlatformVersion)</_WdkVersion>
@@ -20,7 +23,7 @@
     <_WdkKm>$(_WdkRoot)Include\$(_WdkVersion)\km</_WdkKm>
     <_WdkShared>$(_WdkRoot)Include\$(_WdkVersion)\shared</_WdkShared>
   </PropertyGroup>
-  <ItemDefinitionGroup Condition="!Exists('$(VC_IncludePath)\ntifs.h') and Exists('$(_WdkKm)')">
+  <ItemDefinitionGroup Condition="Exists('$(_WdkKm)')">
     <ClCompile>
       <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
