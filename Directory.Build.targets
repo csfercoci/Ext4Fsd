@@ -1,21 +1,13 @@
-<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <!--
-    GitHub Actions runners may lack the x64 WDK kernel toolset
-    (WindowsKernelModeDriver10.0) for the runner's VS version.
-    When the toolset is missing, KM_IncludePath is never set and
-    ntifs.h is not found.  This targets file injects the WDK
-    km/shared include paths into AdditionalIncludeDirectories
-    as a last-resort fallback, evaluated AFTER the import chain.
-  -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" InitialTargets="WdkDiag">
   <!--
     When the WDK kernel toolset (WindowsKernelModeDriver10.0) is missing
     for x64, IncludePath doesn't contain the km/shared dirs and ntifs.h
     is not found.  Always inject WDK include paths from the registry
     when the KitsRoot10 key exists and the km directory is present.
-    On local builds with the toolset registered, this is a no-op because
-    the paths are already in IncludePath.
   -->
-  <Message Importance="high" Text="Directory.Build.targets loaded. KitsRoot10=[$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)] WindowsTargetPlatformVersion=[$(WindowsTargetPlatformVersion)]" />
+  <Target Name="WdkDiag">
+    <Message Importance="high" Text="Directory.Build.targets: KitsRoot10=$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10) WindowsTargetPlatformVersion=$(WindowsTargetPlatformVersion)" />
+  </Target>
   <PropertyGroup>
     <_WdkRoot>$(Registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots@KitsRoot10)</_WdkRoot>
     <_WdkRoot Condition="!HasTrailingSlash('$(_WdkRoot)')">$(_WdkRoot)\</_WdkRoot>
@@ -24,7 +16,6 @@
     <_WdkKm>$(_WdkRoot)Include\$(_WdkVersion)\km</_WdkKm>
     <_WdkShared>$(_WdkRoot)Include\$(_WdkVersion)\shared</_WdkShared>
   </PropertyGroup>
-  <Message Importance="high" Text="WDK include check: _WdkKm=$(_WdkKm) Exists=$([System.IO.Directory]::Exists('$(_WdkKm)'))" />
   <ItemDefinitionGroup Condition="Exists('$(_WdkKm)')">
     <ClCompile>
       <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
