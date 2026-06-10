@@ -705,6 +705,7 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
         } else {
 
             ULONG   BytesRead = ReturnedLength;
+            ULONG   LockSize;
             PUCHAR  SystemVA  = Ext2GetUserBuffer(IrpContext->Irp);
 
             if (ByteOffset.QuadPart + BytesRead > Fcb->Header.ValidDataLength.QuadPart) {
@@ -724,9 +725,25 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
                 }
             }
 
+            /*
+             * Ext2ReadInode() reads whole sectors from the volume, so for a
+             * direct (Nocache) read it rounds BytesRead up to the next sector
+             * and builds extents covering that rounded size.  We must therefore
+             * lock at least that many bytes, otherwise the partial MDLs built
+             * in Ext2ReadWriteBlocks() describe memory past the end of the
+             * source MDL and IoBuildPartialMdl bugchecks 0x12E
+             * (INVALID_MDL_RANGE) on Windows 8+.  The IRP buffer always spans
+             * the full, sector-aligned requested Length (>= BytesRead), so the
+             * rounded-up lock stays within bounds; cap at Length to be safe.
+             */
+            LockSize = (BytesRead + SECTOR_SIZE - 1) & ~((ULONG)SECTOR_SIZE - 1);
+            if (LockSize > Length) {
+                LockSize = Length;
+            }
+
             Status = Ext2LockUserBuffer(
                          IrpContext->Irp,
-                         BytesRead,
+                         LockSize,
                          IoReadAccess );
 
             if (!NT_SUCCESS(Status)) {

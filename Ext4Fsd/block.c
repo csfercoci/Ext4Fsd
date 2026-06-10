@@ -276,6 +276,10 @@ Ext2ReadWriteBlocks(
     ULONG               nChunks = 0;
     ULONG               i;
 
+    PMDL                SrcMdl;
+    PUCHAR              SrcVa;
+    ULONG               SrcBytes;
+
     ASSERT(MasterIrp);
 
     __try {
@@ -296,6 +300,25 @@ Ext2ReadWriteBlocks(
         pContext->Length = Length;
         MasterIrp->IoStatus.Status = STATUS_SUCCESS;
         MasterIrp->IoStatus.Information = 0;
+
+        /*
+         * The partial MDLs we build below describe sub-ranges of the master
+         * IRP's MDL.  Capture the source MDL's base VA and byte count up front
+         * so we can (a) use the MDL's own virtual address as the base for
+         * IoBuildPartialMdl (which is what it validates against, not
+         * Irp->UserBuffer) and (b) reject any extent range that would fall
+         * outside the locked buffer.  Without this check an over-range extent
+         * makes IoBuildPartialMdl bugcheck 0x12E (INVALID_MDL_RANGE).
+         */
+        SrcMdl = MasterIrp->MdlAddress;
+        if (SrcMdl == NULL) {
+            DEBUG(DL_ERR, ( "Ext2ReadWriteBlocks: master IRP has no MDL.\n"));
+            DbgBreak();
+            Status = STATUS_INVALID_USER_BUFFER;
+            __leave;
+        }
+        SrcVa    = (PUCHAR)MmGetMdlVirtualAddress(SrcMdl);
+        SrcBytes = MmGetMdlByteCount(SrcMdl);
 
         if (IrpContext->MajorFunction == IRP_MJ_WRITE) {
             SetFlag(pContext->Flags, EXT2_RW_CONTEXT_WRITE);
@@ -362,6 +385,22 @@ Ext2ReadWriteBlocks(
                 if (ChunkLen > EXT2_RW_CHUNK_SIZE)
                     ChunkLen = EXT2_RW_CHUNK_SIZE;
 
+                /*
+                 * Guard against an extent whose offset/length would describe
+                 * memory outside the master IRP's locked buffer.  Building a
+                 * partial MDL past the end of the source MDL is a fatal driver
+                 * error (bugcheck 0x12E, INVALID_MDL_RANGE), so turn it into a
+                 * recoverable failure instead of crashing the box.
+                 */
+                if ((ULONGLONG)ChunkOffset + ChunkLen > SrcBytes) {
+                    DEBUG(DL_ERR, ( "Ext2ReadWriteBlocks: chunk [%u,+%u) exceeds "
+                                    "source MDL of %u bytes.\n",
+                                    ChunkOffset, ChunkLen, SrcBytes));
+                    DbgBreak();
+                    Status = STATUS_INVALID_PARAMETER;
+                    __leave;
+                }
+
                 if (nChunks >= MaxChunks) {
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     __leave;
@@ -376,7 +415,7 @@ Ext2ReadWriteBlocks(
                     __leave;
                 }
 
-                Mdl = IoAllocateMdl( (PCHAR)MasterIrp->UserBuffer + ChunkOffset,
+                Mdl = IoAllocateMdl( SrcVa + ChunkOffset,
                                      ChunkLen,
                                      FALSE,
                                      FALSE,
@@ -388,9 +427,9 @@ Ext2ReadWriteBlocks(
                     __leave;
                 }
 
-                IoBuildPartialMdl( MasterIrp->MdlAddress,
+                IoBuildPartialMdl( SrcMdl,
                                    Mdl,
-                                   (PCHAR)MasterIrp->UserBuffer + ChunkOffset,
+                                   SrcVa + ChunkOffset,
                                    ChunkLen );
 
                 IoSetNextIrpStackLocation(ChunkIrp);

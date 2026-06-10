@@ -1257,6 +1257,18 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
 
             Irp = IrpContext->Irp;
 
+            /*
+             * On async submission Ext2ReadWriteBlocks transfers ownership of
+             * the master IRP to its completion routine and clears
+             * IrpContext->Irp, returning STATUS_PENDING (which is NT_SUCCESS!).
+             * Do NOT touch the IRP in that case - it may already be completed
+             * and freed.  The __finally sees Irp == NULL and frees the
+             * IrpContext, mirroring the read path (Ext2ReadFile).
+             */
+            if (Status == STATUS_PENDING || Irp == NULL) {
+                __leave;
+            }
+
             if (NT_SUCCESS(Status)) {
                 Irp->IoStatus.Information = Length;
             } else {
@@ -1312,6 +1324,28 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
         if (IrpContext->MajorFunction > IRP_MJ_MAXIMUM_FUNCTION)
             IrpContext->MajorFunction -= IRP_MJ_MAXIMUM_FUNCTION;
 
+        /*
+         * Close any expand transaction we still own BEFORE the IrpContext can
+         * be completed, freed or requeued below.  Ext2CompleteIrpContext /
+         * Ext2FreeIrpContext free the IrpContext and Ext2QueueRequest hands it
+         * to a worker thread, while Ext2JournalStop dereferences
+         * IrpContext->Handle - stopping the txn after them would be a
+         * use-after-free.  Today OwnsExpandTxn can only still be TRUE during
+         * exception unwind (where the free path is skipped), but keep the stop
+         * first so the ordering is safe by construction, and do it while the
+         * FCB resources are still held to match the normal-path call context.
+         */
+        if (OwnsExpandTxn) {
+            /* Mark the file data-dirty BEFORE the expand metadata is handed
+             * to the journal: Ext2FlushDirtyData (data=ordered) only flushes
+             * FCBs carrying FCB_FILE_MODIFIED, so the flag must be visible
+             * by the time a commit can see this transaction's buffers.  The
+             * success-path set at the bottom of this block runs too late. */
+            SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+            Ext2JournalStop(IrpContext, Vcb);
+            OwnsExpandTxn = FALSE;
+        }
+
         if (Irp) {
             if (PagingIoResourceAcquired) {
                 ExReleaseResourceLite(&Fcb->PagingIoResource);
@@ -1352,8 +1386,6 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                 Ext2FreeIrpContext(IrpContext);
             }
         }
-
-        if (OwnsExpandTxn) Ext2JournalStop(IrpContext, Vcb);
     }
 
     DEBUG(DL_IO, ("Ext2WriteFile: %wZ written at Offset=%I64xh Length=%xh PagingIo=%d Nocache=%d "
