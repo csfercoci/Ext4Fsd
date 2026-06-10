@@ -201,6 +201,11 @@ static int journal_commit_sync(struct ext4_handle *eh)
         set_buffer_dirty(jbh);
         mark_buffer_dirty(jbh);
         set_buffer_uptodate(jbh);
+        /* submit_bh consumes one reference (submit_bh_pin ends with put_bh),
+         * and journal_wait_for_writes brelse's wbufs[] later.  Take an extra
+         * reference so the getblk one survives until that brelse; without it
+         * b_count underflows to -1 and the bh + its pinned BCB leak forever. */
+        get_bh(jbh);
         err = submit_bh(WRITE, jbh);
         wbufs[nwbufs++] = jbh;
         if (err)
@@ -215,13 +220,21 @@ static int journal_commit_sync(struct ext4_handle *eh)
         jbh = sb_getblk_zero(eh->sb, (sector_t)data_phys[i]);
         if (!jbh) {
             err = -ENOMEM;
-            goto out_release;
+            /* Wait/release the buffers already submitted in this phase and
+             * Phase 1 — bailing straight to out_release would leak their
+             * wbufs[] references. */
+            goto out_wait_journal;
         }
 
         memcpy(jbh->b_data, bh->b_data, blocksize);
         set_buffer_dirty(jbh);
         mark_buffer_dirty(jbh);
         set_buffer_uptodate(jbh);
+        /* submit_bh consumes one reference (submit_bh_pin ends with put_bh),
+         * and journal_wait_for_writes brelse's wbufs[] later.  Take an extra
+         * reference so the getblk one survives until that brelse; without it
+         * b_count underflows to -1 and the bh + its pinned BCB leak forever. */
+        get_bh(jbh);
         err = submit_bh(WRITE, jbh);
         wbufs[nwbufs++] = jbh;
         if (err)
@@ -275,6 +288,8 @@ static int journal_commit_sync(struct ext4_handle *eh)
             set_buffer_dirty(jbh);
             mark_buffer_dirty(jbh);
             set_buffer_uptodate(jbh);
+            /* See Phase 1: keep a reference for journal_wait_for_writes. */
+            get_bh(jbh);
             err = submit_bh(WRITE, jbh);
             wbufs[nwbufs++] = jbh;
             if (err)
@@ -323,6 +338,11 @@ static int journal_commit_sync(struct ext4_handle *eh)
         set_buffer_dirty(jbh);
         mark_buffer_dirty(jbh);
         set_buffer_uptodate(jbh);
+        /* submit_bh consumes one reference (submit_bh_pin ends with put_bh),
+         * and journal_wait_for_writes brelse's wbufs[] later.  Take an extra
+         * reference so the getblk one survives until that brelse; without it
+         * b_count underflows to -1 and the bh + its pinned BCB leak forever. */
+        get_bh(jbh);
         err = submit_bh(WRITE, jbh);
         wbufs[nwbufs++] = jbh;
         if (err)
@@ -676,6 +696,15 @@ int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
  *
  * Safe to call from any context (kjournald, overflow path, flush).
  * No filesystem locks required — CcFlushCache is self-synchronizing.
+ *
+ * FcbLock is held SHARED across the CcFlushCache calls on purpose: FCBs
+ * with ReferenceCount 0 stay on FcbList and are freed by the FCB reaper
+ * under FcbLock EXCLUSIVE, so the shared hold is what keeps every Fcb in
+ * this walk alive.  Releasing the lock per-file would require
+ * Ext2ReferXcb/Ext2ReleaseFcb, and Ext2ReleaseFcb's lock order
+ * (FcbLock -> MainResource) inverts against force-commit callers that
+ * already hold a MainResource.  Cost is bounded: commits run at most
+ * every EXT2_BATCH_DELAY_MS and only FCB_FILE_MODIFIED files are flushed.
  */
 static void
 Ext2FlushDirtyData(PEXT2_VCB Vcb)
@@ -791,6 +820,11 @@ Ext2KjournaldThread(PVOID Context)
 
     Timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * EXT2_COMMIT_INTERVAL_SECONDS;
 
+    /* Handshake with Ext2StartKjournald: signal that the loop is entered.
+     * Without this, the first Done is only set after the first wake/timeout
+     * and every mount stalled the full 2s handshake wait. */
+    KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+
     while (!Vcb->KjournaldStop) {
 
         KeWaitForSingleObject(
@@ -888,8 +922,11 @@ Ext2StopKjournald(PEXT2_VCB Vcb)
     if (!Vcb->KjournaldThread)
         return;
 
-    /* Cancel any pending batch timer */
+    /* Cancel any pending batch timer.  KeCancelTimer does not wait for an
+     * already-queued/running DPC, and Ext2BatchDpc dereferences the Vcb --
+     * flush DPCs so none can touch the Vcb after teardown proceeds. */
     KeCancelTimer(&Vcb->BatchTimer);
+    KeFlushQueuedDpcs();
     Vcb->BatchTimerArmed = FALSE;
 
     Vcb->KjournaldStop = TRUE;
@@ -908,13 +945,20 @@ Ext2StopKjournald(PEXT2_VCB Vcb)
 /*
  * Force an immediate journal commit for this volume.
  * Called from fsync / FlushFileBuffers / flush IRP paths.
- * Cancels the batch timer and wakes kjournald immediately.
+ *
+ * Commits synchronously in the caller's thread instead of signalling
+ * kjournald: KjournaldDone is set after EVERY kjournald iteration
+ * (including idle timeouts) and stays signalled if nobody waited, so a
+ * waiter could consume a stale signal and return before the commit
+ * actually ran -- an fsync durability hole; two concurrent forcers also
+ * raced for a single Done signal (loser stalled its full timeout).
+ * The inline commit has precedent: the overflow path in
+ * __ext4_journal_stop already commits in the caller's context.
  */
 NTSTATUS
 Ext2JournalForceCommit(PEXT2_VCB Vcb)
 {
     journal_t *journal;
-    LARGE_INTEGER timeout;
 
     if (!Vcb)
         return STATUS_SUCCESS;
@@ -923,26 +967,24 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     if (!journal)
         return STATUS_SUCCESS;
 
-    /* If no pending handle, nothing to commit.  Read under the checkpoint
-     * mutex so we observe a consistent view of the slot rather than racing
-     * a concurrent swap in __ext4_journal_stop / kjournald. */
-    mutex_lock(&journal->j_checkpoint_mutex);
-    if (!Vcb->PendingJournalHandle) {
-        mutex_unlock(&journal->j_checkpoint_mutex);
-        return STATUS_SUCCESS;
-    }
-    mutex_unlock(&journal->j_checkpoint_mutex);
-
-    /* Cancel batch timer — we're committing now */
+    /* Cancel batch timer -- we're committing now.  A timer that fires
+     * anyway just wakes kjournald, which will find the slot empty. */
     KeCancelTimer(&Vcb->BatchTimer);
     Vcb->BatchTimerArmed = FALSE;
 
-    /* Wake kjournald */
-    KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+    /* Swap out and commit the pending handle in this thread. */
+    Ext2JournalFlushPending(Vcb);
 
-    /* Wait for commit to finish (up to 30s) */
-    timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 30;
-    KeWaitForSingleObject(&Vcb->KjournaldDone, Executive, KernelMode, FALSE, &timeout);
+    /* If kjournald (or an overflow eviction) grabbed the handle first,
+     * Ext2JournalFlushPending saw an empty slot while that commit may
+     * still be in flight.  journal_commit_sync holds j_checkpoint_mutex
+     * for the whole commit, so an empty acquire/release here acts as a
+     * completion barrier.  (A committer still in its pre-commit data
+     * flush can slip past this -- with cache-based journal writes the
+     * commit is not a hard disk-order guarantee anyway, see
+     * submit_bh_pin.) */
+    mutex_lock(&journal->j_checkpoint_mutex);
+    mutex_unlock(&journal->j_checkpoint_mutex);
 
     return STATUS_SUCCESS;
 }

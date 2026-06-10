@@ -886,7 +886,12 @@ int sync_dirty_buffer(struct buffer_head *bh)
 {
     int ret = 0;
 
-    ASSERT(atomic_read(&bh->b_count) <= 1);
+    /* No upper bound on b_count here: journal_commit_sync calls this on
+     * home buffers pinned by the deferred handle (one ref) while any
+     * concurrent getblk user may legitimately hold more.  The historical
+     * ASSERT(<= 1) predates deferred handles and bugchecks Debug builds
+     * under normal concurrency. */
+    ASSERT(atomic_read(&bh->b_count) >= 1);
     lock_buffer(bh);
     if (test_clear_buffer_dirty(bh)) {
         get_bh(bh);
