@@ -51,6 +51,13 @@ static int journal_wait_for_writes(struct buffer_head **bufs, int nbufs)
             clear_buffer_write_io_error(bufs[i]);
             err = -EIO;
         }
+        /* The BH dirty flag was set by journal_commit_sync before
+         * submit_bh but submit_bh_pin never clears it (it only calls
+         * CcSetDirtyPinnedData).  Without this, __brelse's
+         * while(buffer_dirty) loop would resubmit every block via
+         * ll_rw_block — a redundant CcSetDirtyPinnedData +
+         * Ext2AddBlockExtent per block. */
+        clear_buffer_dirty(bufs[i]);
         brelse(bufs[i]);
     }
 
@@ -572,6 +579,12 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
         ext4_handle_release_buffers(pending);
         kfree(pending);
 
+        /* Bump sequence so any racing Ext2JournalForceCommit sees
+         * the commit is done (the overflow path runs in the caller's
+         * thread which may hold Fcb locks — deadlock-free because
+         * ForceCommit no longer commits inline). */
+        InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
+
         /* Arm batch timer for the new pending handle */
         if (Vcb->KjournaldThread && !Vcb->BatchTimerArmed) {
             LARGE_INTEGER batchDue;
@@ -775,6 +788,10 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
         journal_commit_sync(pending);
         ext4_handle_release_buffers(pending);
         kfree(pending);
+
+        /* Bump sequence for any racing Ext2JournalForceCommit waiter. */
+        InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
+        KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
     }
 }
 
@@ -854,10 +871,11 @@ Ext2KjournaldThread(PVOID Context)
             journal_commit_sync(pending);
             ext4_handle_release_buffers(pending);
             kfree(pending);
-        }
 
-        /* Signal any waiter (fsync/FlushFileBuffers) that commit is done */
-        KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+            /* Bump sequence and wake any Ext2JournalForceCommit waiters. */
+            InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
+            KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+        }
     }
 
     /* Final flush on shutdown */
@@ -946,19 +964,26 @@ Ext2StopKjournald(PEXT2_VCB Vcb)
  * Force an immediate journal commit for this volume.
  * Called from fsync / FlushFileBuffers / flush IRP paths.
  *
- * Commits synchronously in the caller's thread instead of signalling
- * kjournald: KjournaldDone is set after EVERY kjournald iteration
- * (including idle timeouts) and stays signalled if nobody waited, so a
- * waiter could consume a stale signal and return before the commit
- * actually ran -- an fsync durability hole; two concurrent forcers also
- * raced for a single Done signal (loser stalled its full timeout).
- * The inline commit has precedent: the overflow path in
- * __ext4_journal_stop already commits in the caller's context.
+ * Signals kjournald and waits for completion via JournalCommittedSeq
+ * rather than committing inline: callers (Ext2FlushFile) hold an Fcb
+ * MainResource exclusive, and the commit's data=ordered step
+ * (Ext2FlushDirtyData) needs Vcb->FcbLock shared — that inverts
+ * the lock order against Ext2ReleaseFcb/Ext2PurgeVolume
+ * (FcbLock exclusive → MainResource exclusive), risking ABBA deadlock.
+ * kjournald runs without any MainResource so it can safely flush.
+ *
+ * JournalCommittedSeq is bumped after each successful commit (by
+ * whichever thread did it — kjournald, overflow eviction, or
+ * flush-pending).  The caller snapshots it before waking kjournald
+ * and loops until it advances, providing a stale-signal-proof wait
+ * that also coalesces concurrent fsyncs into one commit cycle.
  */
 NTSTATUS
 Ext2JournalForceCommit(PEXT2_VCB Vcb)
 {
     journal_t *journal;
+    ULONG seq;
+    int iterations = 0;
 
     if (!Vcb)
         return STATUS_SUCCESS;
@@ -967,24 +992,40 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     if (!journal)
         return STATUS_SUCCESS;
 
-    /* Cancel batch timer -- we're committing now.  A timer that fires
-     * anyway just wakes kjournald, which will find the slot empty. */
+    /* Fast path: nothing to commit. */
+    mutex_lock(&journal->j_checkpoint_mutex);
+    if (!Vcb->PendingJournalHandle) {
+        mutex_unlock(&journal->j_checkpoint_mutex);
+        return STATUS_SUCCESS;
+    }
+    mutex_unlock(&journal->j_checkpoint_mutex);
+
+    /* Snapshot the current committed sequence — we'll wait until it
+     * advances past this value, which means at least one commit happened
+     * after our snapshot (and therefore after any metadata our caller
+     * contributed to the pending handle). */
+    seq = Vcb->JournalCommittedSeq;
+
+    /* Cancel batch timer — we want an immediate commit. */
     KeCancelTimer(&Vcb->BatchTimer);
     Vcb->BatchTimerArmed = FALSE;
 
-    /* Swap out and commit the pending handle in this thread. */
-    Ext2JournalFlushPending(Vcb);
+    /* Wake kjournald. */
+    KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
 
-    /* If kjournald (or an overflow eviction) grabbed the handle first,
-     * Ext2JournalFlushPending saw an empty slot while that commit may
-     * still be in flight.  journal_commit_sync holds j_checkpoint_mutex
-     * for the whole commit, so an empty acquire/release here acts as a
-     * completion barrier.  (A committer still in its pre-commit data
-     * flush can slip past this -- with cache-based journal writes the
-     * commit is not a hard disk-order guarantee anyway, see
-     * submit_bh_pin.) */
-    mutex_lock(&journal->j_checkpoint_mutex);
-    mutex_unlock(&journal->j_checkpoint_mutex);
+    /* Wait for committed sequence to advance.  KjournaldDone is an
+     * auto-reset event signaled after each commit; the seq check makes
+     * us resilient to stale signals and concurrent forcers.  6 × 5s =
+     * 30s total, matching the old timeout. */
+    while (Vcb->JournalCommittedSeq == seq && iterations < 6) {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 5;
+        KeWaitForSingleObject(&Vcb->KjournaldDone, Executive,
+                              KernelMode, FALSE, &timeout);
+        if (Vcb->KjournaldStop)
+            break;
+        iterations++;
+    }
 
     return STATUS_SUCCESS;
 }

@@ -776,6 +776,14 @@ typedef struct _EXT2_VCB {
     KDPC                        BatchDpc;
     BOOLEAN                     BatchTimerArmed;
 
+    /* Monotonically increasing sequence number bumped (InterlockedIncrement)
+     * after each successful journal commit by whichever thread did it
+     * (kjournald, overflow eviction, flush-pending).  Ext2JournalForceCommit
+     * snapshots it before waking kjournald and waits until it advances,
+     * providing a race-free completion signal without the ABBA deadlock
+     * risk of committing inline under the caller's locks. */
+    volatile ULONG              JournalCommittedSeq;
+
     /* Maximum file size in blocks ... */
     ULONG                       max_blocks_per_layer[EXT2_BLOCK_TYPES];
     ULONG                       max_data_blocks;

@@ -544,7 +544,14 @@ Ext2ReadWriteBlocks(
 
             if (bCanWait) {
                 if (MasterIrp) {
-                    Status = MasterIrp->IoStatus.Status;
+                    /* Only accept the IRP completion status if we actually
+                     * submitted chunk IRPs — otherwise the build phase set
+                     * an error (SrcMdl NULL, chunk range over bounds, etc.)
+                     * and overwriting it with the IRP's preset SUCCESS would
+                     * swallow the error, returning "success" with no I/O. */
+                    if (nChunks > 0) {
+                        Status = MasterIrp->IoStatus.Status;
+                    }
                 }
                 if (pContext) {
                     Ext2FreePool(pContext, EXT2_RWC_MAGIC);

@@ -981,7 +981,13 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                               &ByteOffset,
                               CEILING_ALIGNED(ULONG, Length, BLOCK_SIZE),
                               &(Irp->IoStatus));
-                ClearLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                /* NOTE: do NOT clear FCB_FILE_MODIFIED here.  This is a
+                 * RANGED flush (only ByteOffset..Length), but the flag
+                 * covers the entire file — clearing it while other dirty
+                 * ranges remain would cause Ext2FlushDirtyData to skip
+                 * those ranges at journal commit time, breaking data=ordered.
+                 * The flag is cleared by full-file flushes (Ext2FlushFile),
+                 * cleanup, and purge paths which CcFlushCache the whole file. */
 
                 if (!NT_SUCCESS(Irp->IoStatus.Status)) {
                     Status = Irp->IoStatus.Status;
@@ -1080,6 +1086,14 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                         }
 
                         if (OwnsExpandTxn) {
+                            /* Mark the file data-dirty BEFORE the expand
+                             * metadata is handed to the pending journal
+                             * handle: a concurrent commit can fire between
+                             * this stop and the success-path flag set at the
+                             * bottom of __finally, and Ext2FlushDirtyData
+                             * must see FCB_FILE_MODIFIED to honor data=ordered
+                             * for this file. */
+                            SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
                             Ext2JournalStop(IrpContext, Vcb);
                             OwnsExpandTxn = FALSE;
                         }

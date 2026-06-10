@@ -600,7 +600,11 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
                              &Irp->IoStatus );
                 if (!NT_SUCCESS(Irp->IoStatus.Status))
                     __leave;
-                ClearLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                /* NOTE: do NOT clear FCB_FILE_MODIFIED here.  This is a
+                 * ranged flush, but the flag covers the entire file — other
+                 * dirty ranges may remain.  CcPurgeCacheSection(NULL,0)
+                 * below flushes+purges the whole file, which is the right
+                 * place to clear (handled by cleanup/purge paths). */
 
                 if (ExAcquireResourceExclusiveLite(&(Fcb->PagingIoResource), TRUE)) {
                     ExReleaseResourceLite(&(Fcb->PagingIoResource));
@@ -719,9 +723,10 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
                     __leave;
                 } else {
                     BytesRead = (ULONG)(Fcb->Header.ValidDataLength.QuadPart - ByteOffset.QuadPart);
-                    if (SystemVA) {
-                        SafeZeroMemory(SystemVA + BytesRead, Length - BytesRead);
-                    }
+                    /* NOTE: the tail [BytesRead, Length) must be zeroed, but we
+                     * can't do it here — Ext2ReadInode DMAs sector-aligned data
+                     * into the same buffer and would overwrite the zeros.  The
+                     * zeroing is done after Ext2ReadInode returns below. */
                 }
             }
 
@@ -759,6 +764,18 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
                          BytesRead,
                          TRUE,
                          NULL );
+
+            /* Ext2ReadInode DMAs sector-aligned data into the buffer,
+             * overwriting any pre-existing contents in [BytesRead, LockSize).
+             * Zero the VDL tail NOW, after the DMA completes, so bytes
+             * beyond ValidDataLength are guaranteed zeros, not stale
+             * on-disk contents. */
+            if (NT_SUCCESS(Status) && BytesRead < Length) {
+                SystemVA = Ext2GetUserBuffer(IrpContext->Irp);
+                if (SystemVA) {
+                    SafeZeroMemory(SystemVA + BytesRead, Length - BytesRead);
+                }
+            }
 
             /* we need re-queue this request in case STATUS_CANT_WAIT
                and fail it in other failure cases  */
