@@ -70,8 +70,8 @@ jobs:
         }
         Write-Host "WDK VSIX registered."
 
-    - name: Build driver (Release|x64)
-      run: msbuild Ext4Fsd.sln /p:Configuration=Release /p:Platform=x64 /p:SpectreMitigation=false /m
+    - name: Build Ext4Fsd (Release|x64)
+      run: cmd /c build.cmd Release x64
 
     - name: Install NSIS
       uses: joncloud/makensis-action@v4
