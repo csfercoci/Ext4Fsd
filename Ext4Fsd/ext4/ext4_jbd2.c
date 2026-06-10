@@ -16,7 +16,12 @@ static inline int ext4_handle_valid(handle_t *handle)
 #define MAX_HANDLE_REVOKES   256
 
 #define EXT2_COMMIT_INTERVAL_SECONDS  10
-#define EXT2_BATCH_DELAY_MS           20
+/* Linux jbd2 default commit interval is 5s.  A short delay here makes every
+ * sustained write/delete workload commit (and data=ordered flush) dozens of
+ * times per second, which degrades the volume to write-through speed.  Crash
+ * durability within this window is still provided by fsync/FlushFileBuffers
+ * (Ext2JournalForceCommit) and the flush/dismount funnel. */
+#define EXT2_BATCH_DELAY_MS           5000
 
 struct ext4_handle {
     handle_t            h;
@@ -694,6 +699,15 @@ Ext2FlushDirtyData(PEXT2_VCB Vcb)
         if (IsFlagOn(Fcb->Flags, FCB_DELETE_PENDING))
             continue;
         if (Fcb->SectionObject.DataSectionObject == NULL)
+            continue;
+        /* Ordered mode only needs files whose data was actually written
+         * since the last flush; flushing every open FCB on every commit
+         * costs a synchronous CcFlushCache per file.  FCB_FILE_MODIFIED is
+         * set by Ext2WriteFile/SetInformation before their metadata reaches
+         * a journal handle, so a commit can never see the metadata without
+         * also seeing the flag.  Deliberately NOT cleared here: the clear
+         * points (flush/cleanup/purge) do their own CcFlushCache first. */
+        if (!IsFlagOn(Fcb->Flags, FCB_FILE_MODIFIED))
             continue;
 
         CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
