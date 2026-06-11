@@ -21,4 +21,14 @@
       <AdditionalIncludeDirectories>$(_WdkKm);$(_WdkShared);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
+  <!--
+    Fail fast with one clear message instead of a C1083 'ntifs.h' per
+    translation unit when a kernel-mode project is built on a machine
+    without the WDK (e.g. GitHub windows-2025 runners, which ship the
+    SDK but not the WDK).
+  -->
+  <Target Name="WdkEnsureKmHeaders" BeforeTargets="ClCompile"
+          Condition="'$(PlatformToolset)' == 'WindowsKernelModeDriver10.0' And !Exists('$(_WdkKm)')">
+    <Error Text="WDK kernel headers not found at '$(_WdkKm)'. Install the Windows Driver Kit for $(_WdkVersion) (CI does this in the 'Install WDK' step of .github/workflows/build.yml)." />
+  </Target>
 </Project>
