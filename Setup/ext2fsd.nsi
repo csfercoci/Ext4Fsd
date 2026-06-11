@@ -30,10 +30,18 @@ OutFile "${PROJECTNAME}-setup.exe"
 !define SRVPATH_X64 "..\Ext2Srv\Release\x64"
 !define SYSPATH_X86 "${SYSPATH_X64}"
 !define SYSPATH_X64 "..\Ext4Fsd\Release\x64"
+; MSVPATH_X64/MFCPATH_X64 may be overridden from the command line
+; (makensis /DMSVPATH_X64=... /DMFCPATH_X64=...) -- CI discovers the
+; redist directories of the installed Visual Studio via vswhere, since
+; the defaults below only match one specific local BuildTools install.
 !define MSVPATH_X86 "${MSVPATH_X64}"
+!ifndef MSVPATH_X64
 !define MSVPATH_X64 "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.CRT"
+!endif
 !define MFCPATH_X86 "${MFCPATH_X64}"
+!ifndef MFCPATH_X64
 !define MFCPATH_X64 "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC\14.44.35112\x64\Microsoft.VC143.MFC"
+!endif
 !define VCDLL_X86 "vcruntime140"
 !define VCDLL_X64A "vcruntime140"
 !define VCDLL_X64B "vcruntime140_1"

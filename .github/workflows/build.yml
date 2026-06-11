@@ -106,11 +106,45 @@ jobs:
     - name: Build Ext4Fsd (Release|x64)
       run: cmd /c build.cmd Release x64
 
+    # windows-2025 runners no longer preinstall NSIS, and
+    # joncloud/makensis-action only locates makensis (it does not install
+    # it).  Install via Chocolatey, skipping when already present (local
+    # runners / future images that bundle it).
     - name: Install NSIS
-      uses: joncloud/makensis-action@v4
+      shell: pwsh
+      run: |
+        if (Test-Path "${env:ProgramFiles(x86)}\NSIS\makensis.exe") {
+          Write-Host "NSIS already installed."
+          return
+        }
+        choco install nsis -y --no-progress
+        if ($LASTEXITCODE -ne 0) { throw "choco install nsis failed: $LASTEXITCODE" }
 
+    # The .nsi defaults point at one specific local BuildTools redist
+    # install; discover the actual VC/MFC redist of the VS on this
+    # machine via vswhere and override them.  Run from Setup\ so the
+    # script's relative ..\ paths resolve as the author documented.
     - name: Build installer
-      run: makensis Setup\ext2fsd.nsi
+      shell: pwsh
+      working-directory: Setup
+      run: |
+        $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+        if (!(Test-Path $makensis)) { $makensis = (Get-Command makensis).Source }
+
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vs = & $vswhere -products * -latest -property installationPath
+        $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT" -Directory |
+               Sort-Object FullName | Select-Object -Last 1
+        $mfc = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC*.MFC" -Directory |
+               Sort-Object FullName | Select-Object -Last 1
+        if (-not $crt -or -not $mfc) {
+          throw "VC/MFC x64 redist not found under $vs\VC\Redist\MSVC"
+        }
+        Write-Host "CRT redist: $($crt.FullName)"
+        Write-Host "MFC redist: $($mfc.FullName)"
+
+        & $makensis "/DMSVPATH_X64=$($crt.FullName)" "/DMFCPATH_X64=$($mfc.FullName)" ext2fsd.nsi
+        if ($LASTEXITCODE -ne 0) { throw "makensis failed: $LASTEXITCODE" }
 
     - name: Upload driver
       uses: actions/upload-artifact@v4
