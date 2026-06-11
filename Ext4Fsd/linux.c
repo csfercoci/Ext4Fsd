@@ -18,6 +18,10 @@ extern PEXT2_GLOBAL Ext2Global;
 
 /* DEFINITIONS *************************************************************/
 
+/* getblk pin retry bound: 50 x 100ms = 5s before giving up and
+ * returning NULL (all sb_getblk callers handle NULL). */
+#define EXT2_MAX_PIN_RETRIES    50
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, kzalloc)
 #endif
@@ -439,6 +443,7 @@ get_block_bh_mdl(
     LARGE_INTEGER offset;
     PVOID         bcb = NULL;
     PVOID         ptr = NULL;
+    int           retries = 0;
 
     struct list_head *entry;
 
@@ -476,6 +481,8 @@ again:
     offset.QuadPart = (s64) bh->b_blocknr;
     offset.QuadPart <<= BLOCK_BITS;
 
+    /* Bounded retry: see get_block_bh_pin -- persistent pin failure must
+     * return NULL instead of spinning this thread forever. */
     if (zero) {
         /* PIN_EXCLUSIVE disabled, likely to deadlock with volume operations */
         if (!CcPreparePinWrite(Vcb->Volume,
@@ -485,8 +492,15 @@ again:
                             PIN_WAIT /* | PIN_EXCLUSIVE */,
                             &bcb,
                             &ptr)) {
-            Ext2Sleep(100);
-            goto again;
+            if (++retries < EXT2_MAX_PIN_RETRIES) {
+                Ext2Sleep(100);
+                goto again;
+            }
+            DEBUG(DL_ERR, ("get_block_bh_mdl: CcPreparePinWrite failed for block %I64u\n",
+                           (unsigned long long)block));
+            free_buffer_head(bh);
+            bh = NULL;
+            goto errorout;
         }
     } else {
         if (!CcPinRead( Vcb->Volume,
@@ -495,8 +509,15 @@ again:
                         PIN_WAIT,
                         &bcb,
                         &ptr)) {
-            Ext2Sleep(100);
-            goto again;
+            if (++retries < EXT2_MAX_PIN_RETRIES) {
+                Ext2Sleep(100);
+                goto again;
+            }
+            DEBUG(DL_ERR, ("get_block_bh_mdl: CcPinRead failed for block %I64u\n",
+                           (unsigned long long)block));
+            free_buffer_head(bh);
+            bh = NULL;
+            goto errorout;
         }
         set_buffer_uptodate(bh);
     }
@@ -615,6 +636,7 @@ get_block_bh_pin(
 {
     PEXT2_VCB Vcb = bdev->bd_priv;
     LARGE_INTEGER offset;
+    int retries = 0;
 
     struct list_head *entry;
 
@@ -652,6 +674,11 @@ again:
     offset.QuadPart = (s64) bh->b_blocknr;
     offset.QuadPart <<= BLOCK_BITS;
 
+    /* Pin failures are retried for a bounded time only: a persistent
+     * failure (cache section gone at dismount, sustained low resources)
+     * must surface as NULL to the caller, not spin this thread forever --
+     * journal_commit_sync calls here under j_checkpoint_mutex, so an
+     * unbounded loop wedges the whole journal. */
     if (zero) {
         if (!CcPreparePinWrite(Vcb->Volume,
                             &offset,
@@ -660,8 +687,15 @@ again:
                             PIN_WAIT,
                             &bh->b_bcb,
                             &bh->b_data)) {
-            Ext2Sleep(100);
-            goto again;
+            if (++retries < EXT2_MAX_PIN_RETRIES) {
+                Ext2Sleep(100);
+                goto again;
+            }
+            DEBUG(DL_ERR, ("get_block_bh_pin: CcPreparePinWrite failed for block %I64u\n",
+                           (unsigned long long)block));
+            free_buffer_head(bh);
+            bh = NULL;
+            goto errorout;
         }
     } else {
         if (!CcPinRead( Vcb->Volume,
@@ -670,8 +704,15 @@ again:
                         PIN_WAIT,
                         &bh->b_bcb,
                         &bh->b_data)) {
-            Ext2Sleep(100);
-            goto again;
+            if (++retries < EXT2_MAX_PIN_RETRIES) {
+                Ext2Sleep(100);
+                goto again;
+            }
+            DEBUG(DL_ERR, ("get_block_bh_pin: CcPinRead failed for block %I64u\n",
+                           (unsigned long long)block));
+            free_buffer_head(bh);
+            bh = NULL;
+            goto errorout;
         }
         set_buffer_uptodate(bh);
     }
