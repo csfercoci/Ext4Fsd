@@ -3183,6 +3183,8 @@ Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
     struct buffer_head *bh = NULL;
     PLIST_ENTRY         next = NULL;
     LARGE_INTEGER       start, now;
+    LONGLONG            DropGrace = (LONGLONG)10*1000*1000*15;
+    LONGLONG            MaxAge = (LONGLONG)10*1000*1000*180;
     BOOLEAN             wake = FALSE;
 
     KeQuerySystemTime(&start);
@@ -3205,8 +3207,8 @@ Ext2QueryUnusedBH(PEXT2_VCB Vcb, PLIST_ENTRY head)
         }
 
         if ( IsFlagOn(Vcb->Flags, VCB_BEING_DROPPED) ||
-            (bh->b_ts_drop.QuadPart + (LONGLONG)10*1000*1000*15) > now.QuadPart ||
-            (bh->b_ts_creat.QuadPart + (LONGLONG)10*1000*1000*180) > now.QuadPart) {
+            now.QuadPart >= bh->b_ts_drop.QuadPart + DropGrace ||
+            now.QuadPart >= bh->b_ts_creat.QuadPart + MaxAge) {
             InsertTailList(head, &bh->b_link);
             buffer_head_remove(&Vcb->bd, bh);
         } else {
@@ -3234,6 +3236,7 @@ Ext2bhReaperThread(
     PEXT2_VCB       Vcb = NULL;
     LIST_ENTRY      List, *Link;
     LARGE_INTEGER   Timeout;
+    LONGLONG        MaxTimeout = (LONGLONG)-10*1000*1000*60; /* 60 seconds */
 
     BOOLEAN         GlobalAcquired = FALSE;
     BOOLEAN         DidNothing = FALSE;
@@ -3255,6 +3258,9 @@ Ext2bhReaperThread(
                 NonWait = FALSE;
             } else if (DidNothing) {
                 Timeout.QuadPart = Timeout.QuadPart * 2;
+                if (Timeout.QuadPart < MaxTimeout) {
+                    Timeout.QuadPart = MaxTimeout;
+                }
             } else {
                 Timeout.QuadPart = (LONGLONG)-10*1000*1000*10; /* 10 seconds */
             }
@@ -3469,6 +3475,7 @@ Ext2FcbReaperThread(
     PEXT2_VCB       Vcb = NULL;
     LIST_ENTRY      List, *Link;
     LARGE_INTEGER   Timeout;
+    LONGLONG        MaxTimeout = (LONGLONG)-10*1000*1000*60; /* 60 seconds */
 
     BOOLEAN         GlobalAcquired = FALSE;
     BOOLEAN         DidNothing = FALSE;
@@ -3490,6 +3497,9 @@ Ext2FcbReaperThread(
                 NonWait = FALSE;
             } else if (DidNothing) {
                 Timeout.QuadPart = Timeout.QuadPart * 2;
+                if (Timeout.QuadPart < MaxTimeout) {
+                    Timeout.QuadPart = MaxTimeout;
+                }
             } else {
                 Timeout.QuadPart = (LONGLONG)-10*1000*1000*20; /* 20 seconds */
             }

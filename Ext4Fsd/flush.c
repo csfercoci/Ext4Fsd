@@ -15,6 +15,11 @@
 
 extern PEXT2_GLOBAL Ext2Global;
 
+typedef struct _EXT2_FLUSH_FCB_ENTRY {
+    LIST_ENTRY  Link;
+    PEXT2_FCB   Fcb;
+} EXT2_FLUSH_FCB_ENTRY, *PEXT2_FLUSH_FCB_ENTRY;
+
 /* DEFINITIONS *************************************************************/
 
 NTSTATUS
@@ -138,25 +143,50 @@ Ext2FlushFiles(
 
     PEXT2_FCB       Fcb;
     PLIST_ENTRY     ListEntry;
+    LIST_ENTRY      FlushList;
+    PEXT2_FLUSH_FCB_ENTRY Entry;
 
     if (IsVcbReadOnly(Vcb)) {
         return STATUS_SUCCESS;
     }
 
     IoStatus.Status = STATUS_SUCCESS;
+    InitializeListHead(&FlushList);
 
     DEBUG(DL_INF, ( "Flushing Files ...\n"));
 
-    // Flush all Fcbs in Vcb list queue.
+    /* Snapshot FcbList under FcbLock, then flush without holding it. */
+    ExAcquireResourceSharedLite(&Vcb->FcbLock, TRUE);
     for (ListEntry = Vcb->FcbList.Flink;
-            ListEntry != &Vcb->FcbList;
-            ListEntry = ListEntry->Flink ) {
+         ListEntry != &Vcb->FcbList;
+         ListEntry = ListEntry->Flink ) {
+
+        Entry = Ext2AllocatePool(NonPagedPool, sizeof(EXT2_FLUSH_FCB_ENTRY),
+                                 EXT2_FLIST_MAGIC);
+        if (!Entry) {
+            IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
 
         Fcb = CONTAINING_RECORD(ListEntry, EXT2_FCB, Next);
-        ExAcquireResourceExclusiveLite(
-            &Fcb->MainResource, TRUE);
+        Ext2ReferXcb(&Fcb->ReferenceCount);
+        Entry->Fcb = Fcb;
+        InsertTailList(&FlushList, &Entry->Link);
+    }
+    ExReleaseResourceLite(&Vcb->FcbLock);
+
+    while (!IsListEmpty(&FlushList)) {
+
+        ListEntry = RemoveHeadList(&FlushList);
+        Entry = CONTAINING_RECORD(ListEntry, EXT2_FLUSH_FCB_ENTRY, Link);
+        Fcb = Entry->Fcb;
+        Ext2FreePool(Entry, EXT2_FLIST_MAGIC);
+
+        ExAcquireResourceExclusiveLite(&Fcb->MainResource, TRUE);
         Ext2FlushFile(IrpContext, Fcb, NULL);
         ExReleaseResourceLite(&Fcb->MainResource);
+
+        Ext2ReleaseFcb(Fcb);
     }
 
     return IoStatus.Status;
