@@ -884,6 +884,50 @@ Ext2DiskIoControl (
     return Status;
 }
 
+/*
+ * Flush the target device's volatile write cache.  Used as the write
+ * barrier after the journal commit block reaches the device, so the
+ * disk cannot reorder the commit record behind the blocks it covers
+ * (the equivalent of the REQ_PREFLUSH|REQ_FUA commit write in Linux
+ * jbd2).  STATUS_INVALID_DEVICE_REQUEST means the stack has no cache
+ * to flush and is treated as success.
+ */
+NTSTATUS
+Ext2DiskFlushBuffers(PEXT2_VCB Vcb)
+{
+    PIRP                Irp;
+    KEVENT              Event;
+
+    NTSTATUS            Status;
+    IO_STATUS_BLOCK     IoStatus;
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+
+    Irp = IoBuildSynchronousFsdRequest(IRP_MJ_FLUSH_BUFFERS,
+                                       Vcb->TargetDeviceObject,
+                                       NULL,
+                                       0,
+                                       NULL,
+                                       &Event,
+                                       &IoStatus);
+
+    if (!Irp) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Status = IoCallDriver(Vcb->TargetDeviceObject, Irp);
+    if (Status == STATUS_PENDING) {
+        KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+        Status = IoStatus.Status;
+    }
+
+    if (Status == STATUS_INVALID_DEVICE_REQUEST) {
+        Status = STATUS_SUCCESS;
+    }
+
+    return Status;
+}
+
 NTSTATUS
 Ext2DiskShutDown(PEXT2_VCB Vcb)
 {

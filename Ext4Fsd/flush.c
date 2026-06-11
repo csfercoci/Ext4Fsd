@@ -56,6 +56,7 @@ Ext2FlushFile (
 )
 {
     IO_STATUS_BLOCK     IoStatus = {0};
+    NTSTATUS            Status;
 
     ASSERT(Fcb != NULL);
     ASSERT((Fcb->Identifier.Type == EXT2FCB) &&
@@ -105,8 +106,13 @@ Ext2FlushFile (
          * the caller's fsync / FlushFileBuffers returns.  Without this,
          * the deferred commit by kjournald (10s interval) would leave a
          * window where a crash loses the just-written metadata.
+         * A failed/timed-out commit must fail the fsync: the caller's
+         * durability contract was not met.
          */
-        Ext2JournalForceCommit(Fcb->Vcb);
+        Status = Ext2JournalForceCommit(Fcb->Vcb);
+        if (!NT_SUCCESS(Status)) {
+            IoStatus.Status = Status;
+        }
 
         /*
          * NOTE: do NOT flush the whole volume here.  Ext2FlushFile runs once

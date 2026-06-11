@@ -883,8 +883,37 @@ void unlock_buffer(struct buffer_head *bh)
     clear_buffer_locked(bh);
 }
 
+/*
+ * submit_bh only dirties the buffer's cache pages (CcSetDirtyPinnedData
+ * + Ext2AddBlockExtent); nothing reaches the disk until the lazy writer
+ * gets around to it.  The journal's ordering guarantees (descriptor and
+ * data blocks on disk before the commit block, commit block before home
+ * blocks, home blocks before the tail advance in the journal
+ * superblock) all funnel through wait_on_buffer, so this must perform a
+ * real write-out: flush the buffer's byte range of the volume stream
+ * and report failure through the Write_EIO flag that all callers
+ * already check (journal_wait_for_writes, sync_dirty_buffer,
+ * jbd2_write_superblock).
+ *
+ * Flushing a clean range (read-side waits, journal recovery) is a
+ * no-op.  The buffer's own pinned BCB does not block the flush:
+ * pinning prevents unmap, not write-out.
+ */
 void __wait_on_buffer(struct buffer_head *bh)
 {
+    PEXT2_VCB Vcb = (PEXT2_VCB)bh->b_bdev->bd_priv;
+    IO_STATUS_BLOCK iosb = {0};
+    LARGE_INTEGER offset;
+
+    ASSERT(Vcb->Identifier.Type == EXT2VCB);
+
+    offset.QuadPart = ((LONGLONG)bh->b_blocknr) << BLOCK_BITS;
+    CcFlushCache(&Vcb->SectionObject, &offset, bh->b_size, &iosb);
+    if (!NT_SUCCESS(iosb.Status)) {
+        DEBUG(DL_ERR, ("wait_on_buffer: flush of block %I64u failed: %xh\n",
+                       (unsigned long long)bh->b_blocknr, iosb.Status));
+        set_buffer_write_io_error(bh);
+    }
 }
 
 void ll_rw_block(int rw, int nr, struct buffer_head * bhs[])
@@ -938,6 +967,10 @@ int sync_dirty_buffer(struct buffer_head *bh)
         get_bh(bh);
         ret = submit_bh(WRITE, bh);
         wait_on_buffer(bh);
+        if (!ret && buffer_write_io_error(bh)) {
+            clear_buffer_write_io_error(bh);
+            ret = -EIO;
+        }
     } else {
         unlock_buffer(bh);
     }

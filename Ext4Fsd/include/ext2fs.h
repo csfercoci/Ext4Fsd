@@ -784,6 +784,13 @@ typedef struct _EXT2_VCB {
      * risk of committing inline under the caller's locks. */
     volatile ULONG              JournalCommittedSeq;
 
+    /* Result of the most recent journal commit cycle: 0 on success, the
+     * negative errno from journal_commit_sync on failure.  Written
+     * (InterlockedExchange) by whichever thread commits, read by
+     * Ext2JournalForceCommit after JournalCommittedSeq advances so fsync
+     * reports commit failures instead of swallowing them. */
+    volatile LONG               JournalCommitError;
+
     /* Maximum file size in blocks ... */
     ULONG                       max_blocks_per_layer[EXT2_BLOCK_TYPES];
     ULONG                       max_data_blocks;
@@ -1281,6 +1288,9 @@ Ext2DiskIoControl (
     IN ULONG            InputBufferSize,
     IN OUT PVOID        OutputBuffer,
     IN OUT PULONG       OutputBufferSize );
+
+NTSTATUS
+Ext2DiskFlushBuffers(PEXT2_VCB Vcb);
 
 NTSTATUS
 Ext2DiskShutDown(PEXT2_VCB Vcb);

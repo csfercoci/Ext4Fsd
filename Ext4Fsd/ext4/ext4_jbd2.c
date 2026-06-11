@@ -80,6 +80,7 @@ static int journal_wait_for_writes(struct buffer_head **bufs, int nbufs)
 static int journal_commit_sync(struct ext4_handle *eh)
 {
     journal_t                  *journal = eh->journal;
+    PEXT2_VCB                  Vcb = (PEXT2_VCB)eh->sb->s_bdev->bd_priv;
     int                        blocksize = journal->j_blocksize;
     unsigned long              head, first, last;
     unsigned long              transaction_start;
@@ -309,6 +310,16 @@ static int journal_commit_sync(struct ext4_handle *eh)
     if (err)
         goto out_release;
 
+    /* Barrier: descriptor/data/revoke blocks must be durable before the
+     * commit block can reach the platter, or a power loss could leave a
+     * valid commit record covering garbage data blocks and recovery
+     * would replay garbage over home locations (Linux jbd2 PREFLUSH on
+     * the commit write). */
+    if (!NT_SUCCESS(Ext2DiskFlushBuffers(Vcb))) {
+        err = -EIO;
+        goto out_release;
+    }
+
     /* Make committed transaction discoverable before commit/home writes. */
     err = jbd2_journal_update_sb_log_tail(journal,
                                           journal->j_transaction_sequence,
@@ -363,6 +374,14 @@ static int journal_commit_sync(struct ext4_handle *eh)
     if (err)
         goto out_release;
 
+    /* Barrier: the commit record must be durable before home writes
+     * begin and before any fsync waiter is told the transaction
+     * committed (Linux jbd2 FUA on the commit block). */
+    if (!NT_SUCCESS(Ext2DiskFlushBuffers(Vcb))) {
+        err = -EIO;
+        goto out_release;
+    }
+
     /* --- Phase 5: Update journal head in memory --- */
 
     journal->j_head = head;
@@ -375,6 +394,13 @@ static int journal_commit_sync(struct ext4_handle *eh)
         err = sync_dirty_buffer(home_bufs[i]);
         if (err)
             goto out_release;
+    }
+
+    /* Barrier: home blocks must be durable before the on-disk tail
+     * advance below discards the only journaled copy of them. */
+    if (!NT_SUCCESS(Ext2DiskFlushBuffers(Vcb))) {
+        err = -EIO;
+        goto out_release;
     }
 
     err = jbd2_journal_update_sb_log_tail(journal,
@@ -579,10 +605,16 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
         ext4_handle_release_buffers(pending);
         kfree(pending);
 
+        if (err)
+            printk(KERN_ERR "Ext4Fsd: journal commit failed: %d\n", err);
+        InterlockedExchange(&Vcb->JournalCommitError, err);
+
         /* Bump sequence so any racing Ext2JournalForceCommit sees
          * the commit is done (the overflow path runs in the caller's
          * thread which may hold Fcb locks — deadlock-free because
-         * ForceCommit no longer commits inline). */
+         * ForceCommit no longer commits inline).  Bumped on failure
+         * too: waiters must wake instead of timing out, and they read
+         * JournalCommitError to learn the outcome. */
         InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
 
         /* Arm batch timer for the new pending handle */
@@ -817,13 +849,20 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
     mutex_unlock(&journal->j_checkpoint_mutex);
 
     if (pending) {
+        int err;
+
         /* Data=ordered: flush file data before metadata commit */
         Ext2FlushDirtyData(Vcb);
-        journal_commit_sync(pending);
+        err = journal_commit_sync(pending);
         ext4_handle_release_buffers(pending);
         kfree(pending);
 
-        /* Bump sequence for any racing Ext2JournalForceCommit waiter. */
+        if (err)
+            printk(KERN_ERR "Ext4Fsd: journal commit failed: %d\n", err);
+        InterlockedExchange(&Vcb->JournalCommitError, err);
+
+        /* Bump sequence for any racing Ext2JournalForceCommit waiter
+         * (on failure too -- the waiter reads JournalCommitError). */
         InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
         KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
     }
@@ -900,13 +939,20 @@ Ext2KjournaldThread(PVOID Context)
         mutex_unlock(&journal->j_checkpoint_mutex);
 
         if (pending) {
+            int err;
+
             /* Data=ordered: flush file data before metadata commit */
             Ext2FlushDirtyData(Vcb);
-            journal_commit_sync(pending);
+            err = journal_commit_sync(pending);
             ext4_handle_release_buffers(pending);
             kfree(pending);
 
-            /* Bump sequence and wake any Ext2JournalForceCommit waiters. */
+            if (err)
+                printk(KERN_ERR "Ext4Fsd: journal commit failed: %d\n", err);
+            InterlockedExchange(&Vcb->JournalCommitError, err);
+
+            /* Bump sequence and wake any Ext2JournalForceCommit waiters
+             * (on failure too -- waiters read JournalCommitError). */
             InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
             KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
         }
@@ -1006,11 +1052,13 @@ Ext2StopKjournald(PEXT2_VCB Vcb)
  * (FcbLock exclusive → MainResource exclusive), risking ABBA deadlock.
  * kjournald runs without any MainResource so it can safely flush.
  *
- * JournalCommittedSeq is bumped after each successful commit (by
- * whichever thread did it — kjournald, overflow eviction, or
- * flush-pending).  The caller snapshots it before waking kjournald
- * and loops until it advances, providing a stale-signal-proof wait
- * that also coalesces concurrent fsyncs into one commit cycle.
+ * JournalCommittedSeq is bumped after each commit cycle, successful
+ * or not (by whichever thread did it — kjournald, overflow eviction,
+ * or flush-pending); the cycle's result is published in
+ * JournalCommitError.  The caller snapshots the sequence before
+ * waking kjournald and loops until it advances, providing a
+ * stale-signal-proof wait that also coalesces concurrent fsyncs into
+ * one commit cycle, then converts JournalCommitError to NTSTATUS.
  */
 NTSTATUS
 Ext2JournalForceCommit(PEXT2_VCB Vcb)
@@ -1060,6 +1108,16 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
             break;
         iterations++;
     }
+
+    /* No commit cycle completed: kjournald is wedged, dead, or being
+     * stopped.  Reporting success here would tell fsync the metadata
+     * is durable when nothing was committed. */
+    if (Vcb->JournalCommittedSeq == seq)
+        return STATUS_IO_TIMEOUT;
+
+    /* A cycle completed after our snapshot -- surface its result. */
+    if (Vcb->JournalCommitError)
+        return Ext2WinntError(Vcb->JournalCommitError);
 
     return STATUS_SUCCESS;
 }
