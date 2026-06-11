@@ -12,10 +12,10 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
     - name: Setup MSBuild
-      uses: microsoft/setup-msbuild@v2
+      uses: microsoft/setup-msbuild@v3
 
     # The windows-2025 runner image ships the Windows 11 SDK 26100 but NO
     # Windows Driver Kit (windows-2022 still had one), so km headers
@@ -147,13 +147,13 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "makensis failed: $LASTEXITCODE" }
 
     - name: Upload driver
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: Ext2Fsd.sys
         path: Ext4Fsd\Release\x64\Ext2Fsd.sys
 
     - name: Upload user tools
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: Ext2Tools
         path: |
@@ -161,7 +161,7 @@ jobs:
           Ext2Mgr\Release\x64\Ext2Mgr.exe
 
     - name: Upload installer
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: Ext2Fsd-setup
         path: Setup\Ext2Fsd-setup.exe
