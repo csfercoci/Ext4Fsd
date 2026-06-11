@@ -8,10 +8,11 @@ on:
 
 jobs:
   build:
-    # Pinned: windows-latest redirects to windows-2025-vs2026 from
-    # 2026-06-15, and the WDK VSIX registration into VS 2026 is
-    # unverified.  Revisit the pin once that image stabilizes.
-    runs-on: windows-2025
+    # Both windows-latest and windows-2025 get redirected to
+    # windows-2025-vs2026 from 2026-06-15, so pinning the old image is
+    # not possible.  Target the new image explicitly -- validated
+    # end-to-end on it (WDK install + VSIX registration into VS 2026).
+    runs-on: windows-2025-vs2026
 
     steps:
     - name: Checkout
