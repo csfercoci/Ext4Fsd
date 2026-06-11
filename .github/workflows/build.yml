@@ -21,38 +21,59 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v3
 
-    # The windows-2025 runner image ships the Windows 11 SDK 26100 but NO
-    # Windows Driver Kit (windows-2022 still had one), so km headers
-    # (ntifs.h) are missing.  Install the WDK only when no Include\*\km
-    # directory exists -- on a machine with the WDK (local dev), this is a
-    # no-op.  Installer URL + silent switch come from the official winget
-    # manifest (Microsoft.WindowsWDK.10.0.26100, 10.1.26100.6584).
-    - name: Install WDK (if kernel headers missing)
+    # GitHub runner images ship the Windows SDK but NO Windows Driver Kit,
+    # so two pieces can be missing (both no-ops on a dev machine that has
+    # the WDKs, like local builds):
+    #  1. km headers (ntifs.h) for the 26100 SDK the project targets
+    #     -> WDK 10.0.26100 (winget manifest 10.1.26100.6584).
+    #  2. VS-version-specific MSBuild tasks: VS 2026 (v18) loads
+    #     Microsoft.DriverKit.Build.Tasks.18.0.dll, which only ships with
+    #     the Dev18/SxS content of WDK 10.0.28000 (10.1.28000.1839).
+    # Installer URLs + silent switches come from the official winget
+    # manifests (Microsoft.WindowsWDK.*).
+    - name: Install WDK (if kernel headers or build tasks missing)
       shell: pwsh
       run: |
-        $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
-        $km = Get-ChildItem -Path $kits -Directory -ErrorAction SilentlyContinue |
+        $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+
+        function Install-Wdk([string]$name, [string]$url) {
+          Write-Host "Installing $name..."
+          $exe = Join-Path $env:RUNNER_TEMP "wdksetup-$name.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe
+          $p = Start-Process -FilePath $exe -ArgumentList '/q','/norestart' -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "$name setup failed with exit code $($p.ExitCode)"
+          }
+        }
+
+        # 1) Kernel headers for the SDK version the project targets.
+        $km = Get-ChildItem -Path "$kits\Include" -Directory -ErrorAction SilentlyContinue |
               Where-Object { Test-Path (Join-Path $_.FullName 'km\ntifs.h') }
         if ($km) {
           Write-Host "WDK kernel headers already present: $($km.Name -join ', ')"
-          return
+        } else {
+          Install-Wdk 'WDK-10.0.26100' 'https://download.microsoft.com/download/41fb59c2-1723-45f9-a270-96b73ad58233/KIT_BUNDLE_WDK_MEDIACREATION/wdksetup.exe'
+          $km = Get-ChildItem -Path "$kits\Include" -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path (Join-Path $_.FullName 'km\ntifs.h') }
+          if (-not $km) { throw "WDK installed but no Include\*\km\ntifs.h found under $kits" }
+          Write-Host "WDK kernel headers installed: $($km.Name -join ', ')"
         }
 
-        Write-Host "WDK kernel headers missing - installing WDK 10.0.26100..."
-        $url = 'https://download.microsoft.com/download/41fb59c2-1723-45f9-a270-96b73ad58233/KIT_BUNDLE_WDK_MEDIACREATION/wdksetup.exe'
-        $exe = Join-Path $env:RUNNER_TEMP 'wdksetup.exe'
-        Invoke-WebRequest -Uri $url -OutFile $exe
-        $p = Start-Process -FilePath $exe -ArgumentList '/q','/norestart' -Wait -PassThru
-        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-          throw "wdksetup.exe failed with exit code $($p.ExitCode)"
+        # 2) Driver build tasks matching the MSBuild/VS major version.
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vsVer = & $vswhere -products * -latest -property installationVersion
+        $vsMajor = [int](($vsVer -split '\.')[0])
+        $tasks = Get-ChildItem "$kits\build\*\bin\Microsoft.DriverKit.Build.Tasks.$vsMajor.0.dll" -ErrorAction SilentlyContinue
+        if ($tasks) {
+          Write-Host "DriverKit build tasks for VS $vsMajor already present."
+        } elseif ($vsMajor -ge 18) {
+          Install-Wdk 'WDK-10.0.28000' 'https://download.microsoft.com/download/302bbcbf-52ae-4e23-ba35-dce560124051/KIT_BUNDLE_WDK_MEDIACREATION/wdksetup.exe'
+          $tasks = Get-ChildItem "$kits\build\*\bin\Microsoft.DriverKit.Build.Tasks.$vsMajor.0.dll" -ErrorAction SilentlyContinue
+          if (-not $tasks) { throw "WDK 28000 installed but Microsoft.DriverKit.Build.Tasks.$vsMajor.0.dll still missing under $kits\build" }
+          Write-Host "DriverKit build tasks for VS $vsMajor installed."
+        } else {
+          throw "No DriverKit build tasks for VS $vsMajor under $kits\build"
         }
-
-        $km = Get-ChildItem -Path $kits -Directory -ErrorAction SilentlyContinue |
-              Where-Object { Test-Path (Join-Path $_.FullName 'km\ntifs.h') }
-        if (-not $km) {
-          throw "wdksetup.exe succeeded but no Include\*\km\ntifs.h found under $kits"
-        }
-        Write-Host "WDK kernel headers installed: $($km.Name -join ', ')"
 
     - name: Register WDK VSIX
       shell: pwsh
