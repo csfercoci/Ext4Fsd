@@ -882,6 +882,14 @@ typedef struct _EXT2_FCB {
 
 } EXT2_FCB, *PEXT2_FCB;
 
+/* Node for FcbList snapshots (EXT2_FLIST_MAGIC): collect referenced FCBs
+ * under FcbLock, then flush them with the lock released.  Used by
+ * Ext2FlushFiles and Ext2FlushDirtyData. */
+typedef struct _EXT2_FLUSH_FCB_ENTRY {
+    LIST_ENTRY  Link;
+    PEXT2_FCB   Fcb;
+} EXT2_FLUSH_FCB_ENTRY, *PEXT2_FLUSH_FCB_ENTRY;
+
 //
 // Flags for EXT2_FCB
 //

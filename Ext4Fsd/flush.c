@@ -15,11 +15,6 @@
 
 extern PEXT2_GLOBAL Ext2Global;
 
-typedef struct _EXT2_FLUSH_FCB_ENTRY {
-    LIST_ENTRY  Link;
-    PEXT2_FCB   Fcb;
-} EXT2_FLUSH_FCB_ENTRY, *PEXT2_FLUSH_FCB_ENTRY;
-
 /* DEFINITIONS *************************************************************/
 
 NTSTATUS

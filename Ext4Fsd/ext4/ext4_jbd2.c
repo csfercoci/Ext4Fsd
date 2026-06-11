@@ -708,25 +708,35 @@ int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
  * commit could leave metadata pointing to stale/unwritten data.
  *
  * Safe to call from any context (kjournald, overflow path, flush).
- * No filesystem locks required — CcFlushCache is self-synchronizing.
  *
- * FcbLock is held SHARED across the CcFlushCache calls on purpose: FCBs
- * with ReferenceCount 0 stay on FcbList and are freed by the FCB reaper
- * under FcbLock EXCLUSIVE, so the shared hold is what keeps every Fcb in
- * this walk alive.  Releasing the lock per-file would require
- * Ext2ReferXcb/Ext2ReleaseFcb, and Ext2ReleaseFcb's lock order
- * (FcbLock -> MainResource) inverts against force-commit callers that
- * already hold a MainResource.  Cost is bounded: commits run at most
- * every EXT2_BATCH_DELAY_MS and only FCB_FILE_MODIFIED files are flushed.
+ * The FcbList is snapshotted under FcbLock SHARED with one reference
+ * taken per FCB, and the CcFlushCache calls run with the lock
+ * released: holding FcbLock across a synchronous flush per modified
+ * file blocked every FcbLock-exclusive waiter (create/close, the FCB
+ * reaper) for the duration of each commit cycle.  The reference keeps
+ * the reaper away (it skips ReferenceCount > 0 under FcbLock
+ * exclusive), so the FCB stays alive without the lock.
+ *
+ * References are dropped with a bare Ext2DerefXcb, NOT Ext2ReleaseFcb:
+ * the overflow path (__ext4_journal_stop) runs in a caller thread that
+ * may hold an Fcb MainResource, and Ext2ReleaseFcb at refcount 0
+ * acquires FcbLock exclusive then MainResource — the ABBA order this
+ * function must avoid (same precedent as Ext2Close).  An FCB deref'ed
+ * to 0 here stays on FcbList with its old TsDrop until the reaper
+ * frees it.
  */
 static void
 Ext2FlushDirtyData(PEXT2_VCB Vcb)
 {
     PEXT2_FCB Fcb;
     PLIST_ENTRY ListEntry;
+    LIST_ENTRY FlushList;
+    PEXT2_FLUSH_FCB_ENTRY Entry;
 
     if (IsVcbReadOnly(Vcb))
         return;
+
+    InitializeListHead(&FlushList);
 
     ExAcquireResourceSharedLite(&Vcb->FcbLock, TRUE);
 
@@ -752,10 +762,34 @@ Ext2FlushDirtyData(PEXT2_VCB Vcb)
         if (!IsFlagOn(Fcb->Flags, FCB_FILE_MODIFIED))
             continue;
 
-        CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
+        Entry = Ext2AllocatePool(NonPagedPool, sizeof(EXT2_FLUSH_FCB_ENTRY),
+                                 EXT2_FLIST_MAGIC);
+        if (!Entry) {
+            /* Can't defer this one: flush inline under the lock (the old
+             * behavior).  Skipping it would let metadata commit ahead of
+             * its data and break data=ordered semantics. */
+            CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
+            continue;
+        }
+
+        Ext2ReferXcb(&Fcb->ReferenceCount);
+        Entry->Fcb = Fcb;
+        InsertTailList(&FlushList, &Entry->Link);
     }
 
     ExReleaseResourceLite(&Vcb->FcbLock);
+
+    while (!IsListEmpty(&FlushList)) {
+
+        ListEntry = RemoveHeadList(&FlushList);
+        Entry = CONTAINING_RECORD(ListEntry, EXT2_FLUSH_FCB_ENTRY, Link);
+        Fcb = Entry->Fcb;
+        Ext2FreePool(Entry, EXT2_FLIST_MAGIC);
+
+        CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
+
+        Ext2DerefXcb(&Fcb->ReferenceCount);
+    }
 }
 
 /*
