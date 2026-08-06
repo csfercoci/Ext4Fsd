@@ -731,6 +731,21 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
             }
 
             /*
+             * The [BytesRead, Length) VDL tail must be zeroed after the disk
+             * transfer completes.  With IRP_CONTEXT_FLAG_WAIT clear the request
+             * would go down Ext2ReadWriteBlocks' async path, where the master
+             * IRP is completed by the completion routine before we could zero
+             * the tail.  Post such requests to a worker thread instead (the
+             * __finally requeues on STATUS_PENDING), where waiting is allowed
+             * and the read runs synchronously.
+             */
+            if (BytesRead < Length &&
+                !IsFlagOn(IrpContext->Flags, IRP_CONTEXT_FLAG_WAIT)) {
+                Status = STATUS_PENDING;
+                __leave;
+            }
+
+            /*
              * Ext2ReadInode() reads whole sectors from the volume, so for a
              * direct (Nocache) read it rounds BytesRead up to the next sector
              * and builds extents covering that rounded size.  We must therefore
@@ -765,13 +780,29 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
                          TRUE,
                          NULL );
 
+            Irp = IrpContext->Irp;
+
+            /*
+             * On async submission Ext2ReadWriteBlocks transfers ownership of
+             * the master IRP to its completion routine and clears
+             * IrpContext->Irp, returning STATUS_PENDING (which passes
+             * NT_SUCCESS!).  The completion routine also releases
+             * PagingIoResource on behalf of this thread, so the __finally
+             * must not touch the IRP or release resources - it skips both
+             * when Irp == NULL, mirroring the write path (Ext2WriteFile).
+             */
+            if (Status == STATUS_PENDING || Irp == NULL) {
+                Irp = NULL;
+                __leave;
+            }
+
             /* Ext2ReadInode DMAs sector-aligned data into the buffer,
              * overwriting any pre-existing contents in [BytesRead, LockSize).
              * Zero the VDL tail NOW, after the DMA completes, so bytes
              * beyond ValidDataLength are guaranteed zeros, not stale
              * on-disk contents. */
             if (NT_SUCCESS(Status) && BytesRead < Length) {
-                SystemVA = Ext2GetUserBuffer(IrpContext->Irp);
+                SystemVA = Ext2GetUserBuffer(Irp);
                 if (SystemVA) {
                     SafeZeroMemory(SystemVA + BytesRead, Length - BytesRead);
                 }
@@ -780,12 +811,6 @@ Ext2ReadFile(IN PEXT2_IRP_CONTEXT IrpContext)
             /* we need re-queue this request in case STATUS_CANT_WAIT
                and fail it in other failure cases  */
             if (!NT_SUCCESS(Status)) {
-                __leave;
-            }
-
-            /* pended by low level device */
-            if (Status == STATUS_PENDING) {
-                IrpContext->Irp = Irp = NULL;
                 __leave;
             }
         }

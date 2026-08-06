@@ -411,6 +411,12 @@ Ext2PnpCancelRemove (
 
     Status = Ext2UnlockVcb(Vcb, IrpContext->FileObject);
 
+    /* the volume was locked for query-remove; drop decoded inodes in
+       case anything was written underneath while locked */
+    if (NT_SUCCESS(Status)) {
+        Ext2InvalidateInodeCacheAll(Vcb);
+    }
+
     ExReleaseResourceLite(&Vcb->MainResource);
 
     IoSkipCurrentIrpStackLocation(IrpContext->Irp);

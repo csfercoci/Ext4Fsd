@@ -36,6 +36,10 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
     IN PIRP Irp,
     IN PVOID Context    );
 
+VOID
+Ext2ReadWriteBlockReleaseWorker (
+    IN PVOID Context    );
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, Ext2LockUserBuffer)
 #pragma alloc_text(PAGE, Ext2ReadSync)
@@ -132,6 +136,10 @@ PVOID
 Ext2GetUserBuffer (IN PIRP Irp )
 {
     ASSERT(Irp != NULL);
+
+    if (Irp == NULL) {
+        return NULL;
+    }
 
     if (Irp->MdlAddress) {
 
@@ -233,16 +241,52 @@ Ext2ReadWriteBlockAsyncCompletionRoutine (
             pContext->MasterIrp->IoStatus.Information = 0;
         }
 
-        /* release the locked resource acquired by the caller */
-        if (pContext->Resource) {
-            ExReleaseResourceForThread(pContext->Resource, pContext->ThreadId);
+        /*
+         * Storage stacks routinely complete I/O from a DPC, so this routine
+         * can run at DISPATCH_LEVEL.  ExReleaseResourceForThread requires
+         * IRQL <= APC_LEVEL; calling it above that corrupts the resource's
+         * owner bookkeeping and bugchecks 0xE3 (RESOURCE_NOT_OWNED) on a
+         * later, unrelated release.  Defer to a work item when necessary.
+         */
+        if (KeGetCurrentIrql() > APC_LEVEL || pContext->RawVolumeWriteSubmitted) {
+            pContext->ReleaseIrp = Irp;
+            ExInitializeWorkItem(&pContext->ReleaseWorkItem,
+                                  Ext2ReadWriteBlockReleaseWorker,
+                                  pContext);
+            ExQueueWorkItem(&pContext->ReleaseWorkItem, DelayedWorkQueue);
+            return STATUS_MORE_PROCESSING_REQUIRED;
+        } else {
+            Ext2ReadWriteBlockReleaseWorker(pContext);
         }
-
-        Ext2FreePool(pContext, EXT2_RWC_MAGIC);
-        DEC_MEM_COUNT(PS_RW_CONTEXT, pContext, sizeof(EXT2_RW_CONTEXT));
     }
 
     return STATUS_SUCCESS;
+}
+
+VOID
+Ext2ReadWriteBlockReleaseWorker (
+    IN PVOID Context
+)
+{
+    PEXT2_RW_CONTEXT pContext = (PEXT2_RW_CONTEXT)Context;
+    PIRP Irp = pContext->ReleaseIrp;
+
+    /* release the locked resource acquired by the caller */
+    if (pContext->Resource) {
+        ExReleaseResourceForThread(pContext->Resource, pContext->ThreadId);
+    }
+
+    if (pContext->RawVolumeWriteSubmitted && pContext->RawVolumeWriteVcb) {
+        /* A failed multi-chunk write can still modify earlier sectors. */
+        Ext2InvalidateRawVolumeCaches(pContext->RawVolumeWriteVcb);
+    }
+
+    if (Irp) {
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    }
+
+    Ext2FreePool(pContext, EXT2_RWC_MAGIC);
+    DEC_MEM_COUNT(PS_RW_CONTEXT, pContext, sizeof(EXT2_RW_CONTEXT));
 }
 
 /*
@@ -300,6 +344,14 @@ Ext2ReadWriteBlocks(
         pContext->Length = Length;
         MasterIrp->IoStatus.Status = STATUS_SUCCESS;
         MasterIrp->IoStatus.Information = 0;
+
+        if (IrpContext->MajorFunction == IRP_MJ_WRITE &&
+            IrpContext->Ccb != NULL &&
+            IrpContext->FileObject != NULL &&
+            IrpContext->FileObject->FsContext == Vcb &&
+            !IsFlagOn(MasterIrp->Flags, IRP_PAGING_IO)) {
+            pContext->RawVolumeWriteVcb = Vcb;
+        }
 
         /*
          * The partial MDLs we build below describe sub-ranges of the master
@@ -495,6 +547,10 @@ Ext2ReadWriteBlocks(
 
         bBugCheck = TRUE;
 
+        if (pContext->RawVolumeWriteVcb != NULL) {
+            pContext->RawVolumeWriteSubmitted = TRUE;
+        }
+
         /*
          * Phase 3: submit all chunk IRPs to the device in one pass.
          * After this point the completion routines own the IRPs.
@@ -554,6 +610,10 @@ Ext2ReadWriteBlocks(
                     }
                 }
                 if (pContext) {
+                    if (pContext->RawVolumeWriteSubmitted &&
+                        pContext->RawVolumeWriteVcb) {
+                        Ext2InvalidateRawVolumeCaches(pContext->RawVolumeWriteVcb);
+                    }
                     Ext2FreePool(pContext, EXT2_RWC_MAGIC);
                     DEC_MEM_COUNT(PS_RW_CONTEXT, pContext, sizeof(EXT2_RW_CONTEXT));
                 }

@@ -352,11 +352,11 @@ Ext2QueryRegistrySettings(IN PUNICODE_STRING  RegistryPath)
                      FALSE);
         if (!NT_SUCCESS(Status)) {
             DEBUG(DL_ERR, ( "Ext2QueryParameters: Wrong CodePage %wZ ...\n", &UniName));
-            RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"default\0", 8);
+            RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"utf8\0", 5);
         }
     } else {
         DEBUG(DL_ERR, ( "Ext2QueryParameters: CodePage not specified.\n"));
-        RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"default\0", 8);
+        RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"utf8\0", 5);
     }
     Ext2Global->Codepage.AnsiName[CODEPAGE_MAXLEN - 1] = 0;
 
@@ -426,6 +426,7 @@ Ext2EresourceAlignmentChecking()
     CL_ASSERT((FIELD_OFFSET(EXT2_VCB, MetaBlock) & 7) == 0);
     CL_ASSERT((FIELD_OFFSET(EXT2_VCB, McbLock) & 7) == 0);
     CL_ASSERT((FIELD_OFFSET(EXT2_VCB, FcbLock) & 7) == 0);
+    CL_ASSERT((FIELD_OFFSET(EXT2_VCB, InodeCacheLock) & 7) == 0);
     CL_ASSERT((FIELD_OFFSET(EXT2_VCB, bd.bd_bh_lock) & 7) == 0);
     CL_ASSERT((FIELD_OFFSET(EXT2_VCB, sbi.s_gd_lock) & 7) == 0);
     CL_ASSERT((FIELD_OFFSET(EXT2_FCBVCB, MainResource) & 7) == 0);

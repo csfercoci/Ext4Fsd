@@ -155,6 +155,8 @@ Ext2AllocateFcb (
 
     Fcb->OpenHandleCount = 0;
     Fcb->ReferenceCount = 0;
+    KeInitializeSpinLock(&Fcb->OrderedDirtyLock);
+    Fcb->OrderedDirtyRangeCount = 0;
     Fcb->Vcb = Vcb;
     Fcb->Inode = &Mcb->Inode;
 
@@ -194,6 +196,98 @@ Ext2AllocateFcb (
     INC_MEM_COUNT(PS_FCB, Fcb, sizeof(EXT2_FCB));
 
     return Fcb;
+}
+
+static VOID
+Ext2MergeOrderedDirtyRangeLocked(
+    IN PEXT2_FCB Fcb,
+    IN LONGLONG Start,
+    IN LONGLONG End
+)
+{
+    ULONG i;
+
+    for (i = 0; i < Fcb->OrderedDirtyRangeCount; i++) {
+        PEXT2_ORDERED_DIRTY_RANGE Range = &Fcb->OrderedDirtyRanges[i];
+
+        if (End < Range->Start || Start > Range->End) {
+            continue;
+        }
+
+        if (Start > Range->Start) {
+            Start = Range->Start;
+        }
+        if (End < Range->End) {
+            End = Range->End;
+        }
+
+        Fcb->OrderedDirtyRangeCount--;
+        Fcb->OrderedDirtyRanges[i] =
+            Fcb->OrderedDirtyRanges[Fcb->OrderedDirtyRangeCount];
+        i = (ULONG)-1;
+    }
+
+    if (Fcb->OrderedDirtyRangeCount < EXT2_ORDERED_DIRTY_RANGE_COUNT) {
+        PEXT2_ORDERED_DIRTY_RANGE Range =
+            &Fcb->OrderedDirtyRanges[Fcb->OrderedDirtyRangeCount++];
+        Range->Start = Start;
+        Range->End = End;
+    } else {
+        ULONG Best = 0;
+        ULONGLONG BestGrowth = MAXULONGLONG;
+
+        for (i = 0; i < EXT2_ORDERED_DIRTY_RANGE_COUNT; i++) {
+            PEXT2_ORDERED_DIRTY_RANGE Range = &Fcb->OrderedDirtyRanges[i];
+            LONGLONG MergedStart = (Start < Range->Start) ? Start : Range->Start;
+            LONGLONG MergedEnd = (End > Range->End) ? End : Range->End;
+            ULONGLONG Growth = (ULONGLONG)(MergedEnd - MergedStart) -
+                               (ULONGLONG)(Range->End - Range->Start);
+
+            if (Growth < BestGrowth) {
+                BestGrowth = Growth;
+                Best = i;
+            }
+        }
+
+        Fcb->OrderedDirtyRanges[Best].Start =
+            (Start < Fcb->OrderedDirtyRanges[Best].Start) ?
+            Start : Fcb->OrderedDirtyRanges[Best].Start;
+        Fcb->OrderedDirtyRanges[Best].End =
+            (End > Fcb->OrderedDirtyRanges[Best].End) ?
+            End : Fcb->OrderedDirtyRanges[Best].End;
+    }
+}
+
+VOID
+Ext2MarkOrderedDirtyRange(
+    IN PEXT2_FCB Fcb,
+    IN LONGLONG Start,
+    IN LONGLONG End
+)
+{
+    KIRQL Irql;
+
+    if (!Fcb || End <= Start) {
+        return;
+    }
+
+    KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
+    Ext2MergeOrderedDirtyRangeLocked(Fcb, Start, End);
+    KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
+}
+
+VOID
+Ext2ResetOrderedDirtyRanges(IN PEXT2_FCB Fcb)
+{
+    KIRQL Irql;
+
+    if (!Fcb) {
+        return;
+    }
+
+    KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
+    Fcb->OrderedDirtyRangeCount = 0;
+    KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
 }
 
 VOID
@@ -466,6 +560,11 @@ struct dentry *Ext2BuildEntry(PEXT2_VCB Vcb, PEXT2_MCB Dcb, PUNICODE_STRING File
         Status = Ext2UnicodeToOEM(Vcb, &Oem, FileName);
         if (!NT_SUCCESS(Status)) {
             DEBUG(DL_CP, ("Ext2BuildEntry: failed to convert %S to OEM.\n", FileName->Buffer));
+            __leave;
+        }
+        if (Oem.Length == 0 || Oem.Length > EXT2_NAME_LEN) {
+            DEBUG(DL_CP, ("Ext2BuildEntry: encoded name is too long.\n"));
+            Status = STATUS_OBJECT_NAME_INVALID;
             __leave;
         }
         de->d_name.len  = Oem.Length;
@@ -1413,6 +1512,110 @@ Ext2BuildName(
     return TRUE;
 }
 
+#define EXT2_MCBHASH_MAGIC       'HM2E'
+#define EXT2_MCB_HASH_THRESHOLD  16
+#define EXT2_MCB_HASH_MIN_BITS   5
+
+static ULONG
+Ext2McbNameHash(PCUNICODE_STRING Name)
+{
+    ULONG   Hash = 5381;
+    ULONG   n = (ULONG)(Name->Length / sizeof(WCHAR));
+    ULONG   i;
+
+    for (i = 0; i < n; i++) {
+        Hash = Hash * 33 + (ULONG)RtlUpcaseUnicodeChar(Name->Buffer[i]);
+    }
+    return Hash;
+}
+
+static PEXT2_MCB
+Ext2McbLookupChild(PEXT2_MCB Dir, PUNICODE_STRING FileName)
+{
+    PEXT2_MCB TmpMcb;
+
+    if (Dir->ChildBuckets) {
+        ULONG b = Ext2McbNameHash(FileName) & Dir->ChildBucketMask;
+        TmpMcb = Dir->ChildBuckets[b];
+        while (TmpMcb) {
+            if (!RtlCompareUnicodeString(&TmpMcb->ShortName, FileName, TRUE)) {
+                Ext2ReferMcb(TmpMcb);
+                return TmpMcb;
+            }
+            TmpMcb = TmpMcb->HashNext;
+        }
+    } else {
+        TmpMcb = Dir->Child;
+        while (TmpMcb) {
+            if (!RtlCompareUnicodeString(&TmpMcb->ShortName, FileName, TRUE)) {
+                Ext2ReferMcb(TmpMcb);
+                return TmpMcb;
+            }
+            TmpMcb = TmpMcb->Next;
+        }
+    }
+    return NULL;
+}
+
+static VOID
+Ext2McbHashInsert(PEXT2_MCB Dir, PEXT2_MCB Child)
+{
+    ULONG b = Ext2McbNameHash(&Child->ShortName) & Dir->ChildBucketMask;
+    Child->HashNext = Dir->ChildBuckets[b];
+    Dir->ChildBuckets[b] = Child;
+}
+
+static VOID
+Ext2McbHashRemove(PEXT2_MCB Dir, PEXT2_MCB Child)
+{
+    ULONG       b = Ext2McbNameHash(&Child->ShortName) & Dir->ChildBucketMask;
+    PEXT2_MCB  *pp = &Dir->ChildBuckets[b];
+
+    while (*pp) {
+        if (*pp == Child) {
+            *pp = Child->HashNext;
+            Child->HashNext = NULL;
+            return;
+        }
+        pp = &(*pp)->HashNext;
+    }
+}
+
+static VOID
+Ext2McbHashBuild(PEXT2_MCB Dir)
+{
+    ULONG       Count;
+    PEXT2_MCB  *Buckets;
+    PEXT2_MCB   Cur;
+
+    Count = (ULONG)1 << EXT2_MCB_HASH_MIN_BITS;
+    while (Count < Dir->ChildCount * 2 && Count < ((ULONG)1 << 16)) {
+        Count <<= 1;
+    }
+
+    if (Dir->ChildBuckets) {
+        Ext2FreePool(Dir->ChildBuckets, EXT2_MCBHASH_MAGIC);
+        Dir->ChildBuckets = NULL;
+        Dir->ChildBucketMask = 0;
+    }
+
+    Buckets = (PEXT2_MCB *)Ext2AllocatePool(
+                NonPagedPool, Count * sizeof(PEXT2_MCB), EXT2_MCBHASH_MAGIC);
+    if (!Buckets) {
+        return;
+    }
+    RtlZeroMemory(Buckets, Count * sizeof(PEXT2_MCB));
+
+    Dir->ChildBuckets = Buckets;
+    Dir->ChildBucketMask = Count - 1;
+
+    for (Cur = Dir->Child; Cur; Cur = Cur->Next) {
+        ULONG b = Ext2McbNameHash(&Cur->ShortName) & Dir->ChildBucketMask;
+        Cur->HashNext = Buckets[b];
+        Buckets[b] = Cur;
+    }
+}
+
 PEXT2_MCB
 Ext2AllocateMcb (
     IN PEXT2_VCB        Vcb,
@@ -1571,6 +1774,11 @@ Ext2FreeMcb (IN PEXT2_VCB Vcb, IN PEXT2_MCB Mcb)
         Ext2FreeEntry(Mcb->de);
     }
 
+    if (Mcb->ChildBuckets) {
+        Ext2FreePool(Mcb->ChildBuckets, EXT2_MCBHASH_MAGIC);
+        Mcb->ChildBuckets = NULL;
+    }
+
     Mcb->Identifier.Type = 0;
     Mcb->Identifier.Size = 0;
 
@@ -1635,26 +1843,13 @@ Ext2SearchMcbWithoutLock(
 
         if (IsMcbSymLink(Parent)) {
             if (Parent->Target) {
-                TmpMcb = Parent->Target->Child;
                 ASSERT(!IsMcbSymLink(Parent->Target));
+                TmpMcb = Ext2McbLookupChild(Parent->Target, FileName);
             } else {
-                TmpMcb = NULL;
                 __leave;
             }
         } else {
-            TmpMcb = Parent->Child;
-        }
-
-        while (TmpMcb) {
-
-            if (!RtlCompareUnicodeString(
-                        &(TmpMcb->ShortName),
-                        FileName, TRUE )) {
-                Ext2ReferMcb(TmpMcb);
-                break;
-            }
-
-            TmpMcb = TmpMcb->Next;
+            TmpMcb = Ext2McbLookupChild(Parent, FileName);
         }
 
     } __finally {
@@ -1688,12 +1883,19 @@ Ext2InsertMcb (
             ASSERT(!IsMcbSymLink(Parent));
         }
 
-        Mcb = Parent->Child;
-        while (Mcb) {
-            if (Mcb == Child) {
-                break;
+        if (Parent->ChildBuckets) {
+            ULONG b = Ext2McbNameHash(&Child->ShortName) & Parent->ChildBucketMask;
+            Mcb = Parent->ChildBuckets[b];
+            while (Mcb) {
+                if (Mcb == Child) break;
+                Mcb = Mcb->HashNext;
             }
-            Mcb = Mcb->Next;
+        } else {
+            Mcb = Parent->Child;
+            while (Mcb) {
+                if (Mcb == Child) break;
+                Mcb = Mcb->Next;
+            }
         }
 
         if (Mcb) {
@@ -1715,6 +1917,15 @@ Ext2InsertMcb (
             Child->de->d_parent = Parent->de;
             Ext2ReferMcb(Parent);
             SetLongFlag(Child->Flags, MCB_ENTRY_TREE);
+            Parent->ChildCount++;
+            if (Parent->ChildBuckets) {
+                Ext2McbHashInsert(Parent, Child);
+                if (Parent->ChildCount > (Parent->ChildBucketMask + 1) * 4) {
+                    Ext2McbHashBuild(Parent);
+                }
+            } else if (Parent->ChildCount >= EXT2_MCB_HASH_THRESHOLD) {
+                Ext2McbHashBuild(Parent);
+            }
         }
 
     } __finally {
@@ -1761,6 +1972,12 @@ Ext2RemoveMcb (
             }
 
             if (bLinked) {
+                if (Mcb->Parent->ChildBuckets) {
+                    Ext2McbHashRemove(Mcb->Parent, Mcb);
+                }
+                if (Mcb->Parent->ChildCount > 0) {
+                    Mcb->Parent->ChildCount--;
+                }
                 if (IsFlagOn(Mcb->Flags, MCB_ENTRY_TREE)) {
                     DEBUG(DL_RES, ("Mcb %p %wZ removed from Mcb %p %wZ\n", Mcb,
                                    &Mcb->FullName, Mcb->Parent, &Mcb->Parent->FullName));
@@ -2352,6 +2569,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
         ExInitializeResourceLite(&Vcb->MetaBlock);
         ExInitializeResourceLite(&Vcb->McbLock);
         ExInitializeResourceLite(&Vcb->FcbLock);
+        ExInitializeResourceLite(&Vcb->InodeCacheLock);
         ExInitializeResourceLite(&Vcb->sbi.s_gd_lock);
 #ifndef _WIN2K_TARGET_
         ExInitializeFastMutex(&Vcb->Mutex);
@@ -2392,6 +2610,8 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
                                         'SNIE', 0);
 
         InodeLookasideInitialized = TRUE;
+
+        Ext2InitializeInodeCache(Vcb);
 
         /* initialize label in Vpb */
         Status = Ext2InitializeLabel(Vcb, sb);
@@ -2742,6 +2962,8 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
                 ExDeleteLookasideListEx(&(Vcb->InodeLookasideList));
             }
 
+            Ext2DestroyInodeCache(Vcb);
+
             if (ExtentsInitialized) {
                 if (Vcb->bd.bd_bh_cache) {
                     if (GroupLoaded)
@@ -2767,6 +2989,7 @@ Ext2InitializeVcb( IN PEXT2_IRP_CONTEXT IrpContext,
                 ExDeleteResourceLite(&Vcb->McbLock);
                 ExDeleteResourceLite(&Vcb->MetaInode);
                 ExDeleteResourceLite(&Vcb->MetaBlock);
+                ExDeleteResourceLite(&Vcb->InodeCacheLock);
                 ExDeleteResourceLite(&Vcb->sbi.s_gd_lock);
                 ExDeleteResourceLite(&Vcb->MainResource);
                 ExDeleteResourceLite(&Vcb->PagingIoResource);
@@ -2865,11 +3088,13 @@ Ext2DestroyVcb (IN PEXT2_VCB Vcb)
 
     ObDereferenceObject(Vcb->TargetDeviceObject);
 
+    Ext2DestroyInodeCache(Vcb);
     ExDeleteLookasideListEx(&(Vcb->InodeLookasideList));
     ExDeleteResourceLite(&Vcb->FcbLock);
     ExDeleteResourceLite(&Vcb->McbLock);
     ExDeleteResourceLite(&Vcb->MetaInode);
     ExDeleteResourceLite(&Vcb->MetaBlock);
+    ExDeleteResourceLite(&Vcb->InodeCacheLock);
     ExDeleteResourceLite(&Vcb->sbi.s_gd_lock);
     ExDeleteResourceLite(&Vcb->PagingIoResource);
     ExDeleteResourceLite(&Vcb->MainResource);

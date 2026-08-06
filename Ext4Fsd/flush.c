@@ -93,6 +93,10 @@ Ext2FlushFile (
                         Fcb->Inode->i_ino, Fcb->Mcb->ShortName.Buffer));
 
         CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
+        if (!NT_SUCCESS(IoStatus.Status)) {
+            __leave;
+        }
+        Ext2ResetOrderedDirtyRanges(Fcb);
         ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
 
         if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {

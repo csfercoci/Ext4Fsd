@@ -276,6 +276,12 @@ Ext2UnlockVolume (
 
         Status = Ext2UnlockVcb(Vcb, IrpSp->FileObject);
 
+        /* arbitrary raw writes may have occurred while the volume was
+           locked - drop all decoded inodes */
+        if (NT_SUCCESS(Status)) {
+            Ext2InvalidateInodeCacheAll(Vcb);
+        }
+
     } __finally {
 
         if (VcbResourceAcquired) {
@@ -2807,6 +2813,9 @@ Ext2PurgeVolume (IN PEXT2_VCB Vcb,
         /* discard buffer_headers for group_desc */
         Ext2DropBH(Vcb);
 
+        /* raw volume writes may have changed inode records under us */
+        Ext2InvalidateInodeCacheAll(Vcb);
+
         if (FlushBeforePurge) {
             ExAcquireSharedStarveExclusive(&Vcb->PagingIoResource, TRUE);
             ExReleaseResourceLite(&Vcb->PagingIoResource);
@@ -2859,7 +2868,10 @@ Ext2PurgeFile ( IN PEXT2_FCB Fcb,
         ExAcquireSharedStarveExclusive(&Fcb->PagingIoResource, TRUE);
         ExReleaseResourceLite(&Fcb->PagingIoResource);
         CcFlushCache(&Fcb->SectionObject, NULL, 0, &IoStatus);
-        ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        if (NT_SUCCESS(IoStatus.Status)) {
+            Ext2ResetOrderedDirtyRanges(Fcb);
+            ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        }
     }
 
     if (Fcb->SectionObject.ImageSectionObject) {

@@ -1,0 +1,4 @@
+# Sources are stored with CRLF; don't flag the CR as trailing whitespace
+# in `git diff --check` / `git apply --whitespace`. This does NOT enable
+# line-ending normalization.
+* whitespace=cr-at-eol

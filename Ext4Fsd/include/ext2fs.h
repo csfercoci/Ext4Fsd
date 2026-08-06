@@ -618,6 +618,21 @@ typedef struct _EXT2_FCBVCB {
 
 } EXT2_FCBVCB, *PEXT2_FCBVCB;
 
+typedef struct _EXT2_INODE_CACHE_ENTRY {
+    LIST_ENTRY                          LruLink;
+    struct _EXT2_INODE_CACHE_ENTRY     *HashNext;
+    ULONG                               InodeNo;
+    BOOLEAN                             Valid;
+    struct inode                        Inode;
+} EXT2_INODE_CACHE_ENTRY, *PEXT2_INODE_CACHE_ENTRY;
+
+#define EXT2_ORDERED_DIRTY_RANGE_COUNT  8
+
+typedef struct _EXT2_ORDERED_DIRTY_RANGE {
+    LONGLONG    Start;
+    LONGLONG    End;
+} EXT2_ORDERED_DIRTY_RANGE, *PEXT2_ORDERED_DIRTY_RANGE;
+
 //
 // EXT2_VCB Volume Control Block
 //
@@ -722,6 +737,19 @@ typedef struct _EXT2_VCB {
     // Inode lookaside list
     LOOKASIDE_LIST_EX           InodeLookasideList;
 
+    // Decoded inode metadata cache for directory enumeration hot paths.
+    // Read-only accelerator, never a source of truth for writes.
+    // InodeCacheLock is a leaf lock: acquire nothing while holding it.
+    ERESOURCE                   InodeCacheLock;
+    PEXT2_INODE_CACHE_ENTRY     InodeCacheEntries;
+    PEXT2_INODE_CACHE_ENTRY    *InodeCacheHash;
+    LIST_ENTRY                  InodeCacheLru;
+    ULONG                       InodeCacheCount;
+    ULONG                       InodeCacheHashMask;
+    // Bumped by every invalidation; a block decode started before the
+    // bump must not populate the cache (closes read-vs-write races).
+    volatile ULONG              InodeCacheGen;
+
     // Flags for the volume
     ULONG                       Flags;
 
@@ -755,11 +783,11 @@ typedef struct _EXT2_VCB {
     struct super_block          sb;
     struct ext3_sb_info         sbi;
 
-    /* Deferred journal commit accumulator.
-     * When non-NULL, dirty metadata buffers from closed handles are
-     * merged here instead of being committed synchronously.
-     * Flushed by kjournald thread or Ext2JournalFlushPending. */
+    /* Deferred journal commit FIFO.  Closed handles merge into the tail when
+     * possible; kjournald commits the head without blocking the caller. */
     void                        *PendingJournalHandle;
+    void                        *PendingJournalTail;
+    ULONG                       JournalCommitActive;
 
     /* kjournald: dedicated journal commit thread per volume.
      * Commits the pending handle every CommitIntervalSeconds (default 10s)
@@ -878,6 +906,11 @@ typedef struct _EXT2_FCB {
     // Flags for the FCB
     ULONG                           Flags;
 
+    // Dirty byte ranges whose data must reach disk before ordered metadata commit.
+    KSPIN_LOCK                      OrderedDirtyLock;
+    ULONG                           OrderedDirtyRangeCount;
+    EXT2_ORDERED_DIRTY_RANGE        OrderedDirtyRanges[EXT2_ORDERED_DIRTY_RANGE_COUNT];
+
     // Pointer to the inode
     struct inode                   *Inode;
 
@@ -968,6 +1001,11 @@ struct _EXT2_MCB {
 
     struct inode                    Inode;
     struct dentry                  *de;
+
+    PEXT2_MCB                       HashNext;
+    PEXT2_MCB                      *ChildBuckets;
+    ULONG                           ChildBucketMask;
+    ULONG                           ChildCount;
 };
 
 //
@@ -1940,6 +1978,38 @@ Ext2LoadInode (
 );
 
 BOOLEAN
+Ext2LoadInodeCached (
+    IN PEXT2_VCB Vcb,
+    IN struct inode *Inode
+);
+
+VOID
+Ext2InvalidateInodeCache(
+    IN PEXT2_VCB Vcb,
+    IN ULONG InodeNo
+);
+
+VOID
+Ext2InvalidateInodeCacheAll(
+    IN PEXT2_VCB Vcb
+);
+
+VOID
+Ext2InvalidateRawVolumeCaches(
+    IN PEXT2_VCB Vcb
+);
+
+VOID
+Ext2InitializeInodeCache(
+    IN PEXT2_VCB Vcb
+);
+
+VOID
+Ext2DestroyInodeCache(
+    IN PEXT2_VCB Vcb
+);
+
+BOOLEAN
 Ext2ClearInode (
     IN PEXT2_IRP_CONTEXT    IrpContext,
     IN PEXT2_VCB Vcb,
@@ -2030,12 +2100,6 @@ Ext2BlockMap(
     IN BOOLEAN              bAlloc,
     OUT PULONG              pBlock,
     OUT PULONG              Number
-);
-
-VOID
-Ext2UpdateVcbStat(
-    IN PEXT2_IRP_CONTEXT    IrpContext,
-    IN PEXT2_VCB            Vcb
 );
 
 NTSTATUS
@@ -2718,6 +2782,16 @@ VOID
 Ext2ReleaseFcb (IN PEXT2_FCB Fcb);
 
 VOID
+Ext2MarkOrderedDirtyRange(
+    IN PEXT2_FCB Fcb,
+    IN LONGLONG Start,
+    IN LONGLONG End
+);
+
+VOID
+Ext2ResetOrderedDirtyRanges(IN PEXT2_FCB Fcb);
+
+VOID
 Ext2InsertFcb(PEXT2_VCB Vcb, PEXT2_FCB Fcb);
 
 PEXT2_CCB
@@ -3188,6 +3262,18 @@ typedef struct _EXT2_RW_CONTEXT {
     PFILE_OBJECT        FileObject;
     ULONG               Flags;
     BOOLEAN             Wait;
+
+    /* Async completion can run at DISPATCH_LEVEL (storage stack completes
+     * in a DPC).  ExReleaseResourceForThread requires IRQL <= APC_LEVEL, so
+     * the final associated IRP is held until this work item releases the FCB
+     * resource, then the worker completes that IRP and only then frees this
+     * context. */
+    PIRP                ReleaseIrp;
+    WORK_QUEUE_ITEM     ReleaseWorkItem;
+
+    /* Invalidate decoded inodes after a raw volume write completes. */
+    PEXT2_VCB           RawVolumeWriteVcb;
+    BOOLEAN             RawVolumeWriteSubmitted;
 
 } EXT2_RW_CONTEXT, *PEXT2_RW_CONTEXT;
 

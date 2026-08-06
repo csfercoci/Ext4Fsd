@@ -440,6 +440,276 @@ Ext2RefreshGroup(
     return TRUE;
 }
 
+#define EXT2_INODE_CACHE_MAGIC       'CI2E'
+#define EXT2_INODE_CACHE_SIZE        1024
+#define EXT2_INODE_CACHE_HASH_SIZE   1024
+
+static ULONG
+Ext2InodeCacheHash(ULONG InodeNo)
+{
+    return InodeNo * 2654435761u;
+}
+
+static PEXT2_INODE_CACHE_ENTRY
+Ext2InodeCacheFindLocked(PEXT2_VCB Vcb, ULONG InodeNo)
+{
+    PEXT2_INODE_CACHE_ENTRY Entry;
+    ULONG Bucket;
+
+    if (!Vcb->InodeCacheHash || Vcb->InodeCacheHashMask == 0) {
+        return NULL;
+    }
+
+    Bucket = Ext2InodeCacheHash(InodeNo) & Vcb->InodeCacheHashMask;
+    Entry = Vcb->InodeCacheHash[Bucket];
+    while (Entry) {
+        if (Entry->Valid && Entry->InodeNo == InodeNo) {
+            return Entry;
+        }
+        Entry = Entry->HashNext;
+    }
+
+    return NULL;
+}
+
+static VOID
+Ext2InodeCacheRemoveHashLocked(PEXT2_VCB Vcb, PEXT2_INODE_CACHE_ENTRY Entry)
+{
+    PEXT2_INODE_CACHE_ENTRY *Prev;
+    ULONG Bucket;
+
+    if (!Entry->Valid || !Vcb->InodeCacheHash || Vcb->InodeCacheHashMask == 0) {
+        return;
+    }
+
+    Bucket = Ext2InodeCacheHash(Entry->InodeNo) & Vcb->InodeCacheHashMask;
+    Prev = &Vcb->InodeCacheHash[Bucket];
+    while (*Prev) {
+        if (*Prev == Entry) {
+            *Prev = Entry->HashNext;
+            Entry->HashNext = NULL;
+            return;
+        }
+        Prev = &(*Prev)->HashNext;
+    }
+}
+
+static VOID
+Ext2InodeCacheInsertHashLocked(PEXT2_VCB Vcb, PEXT2_INODE_CACHE_ENTRY Entry)
+{
+    ULONG Bucket;
+
+    Bucket = Ext2InodeCacheHash(Entry->InodeNo) & Vcb->InodeCacheHashMask;
+    Entry->HashNext = Vcb->InodeCacheHash[Bucket];
+    Vcb->InodeCacheHash[Bucket] = Entry;
+}
+
+/* Copy a cached inode into the caller's inode without clobbering the
+   caller's identity/ownership fields (i_priv points at the caller's Mcb). */
+static VOID
+Ext2InodeCacheCopyOut(struct inode *Dst, struct inode *Src)
+{
+    struct super_block *sb   = Dst->i_sb;
+    void               *priv = Dst->i_priv;
+    atomic_t            cnt  = Dst->i_count;
+    __u32               ver  = Dst->i_version;
+
+    *Dst = *Src;
+    Dst->i_sb = sb;
+    Dst->i_priv = priv;
+    Dst->i_count = cnt;
+    Dst->i_version = ver;
+}
+
+static VOID
+Ext2InodeCacheStore(PEXT2_VCB Vcb, ULONG InodeNo, struct inode *Inode, ULONG Generation)
+{
+    PEXT2_INODE_CACHE_ENTRY Entry;
+
+    if (!Vcb->InodeCacheEntries || !Vcb->InodeCacheHash ||
+        Vcb->InodeCacheCount == 0 || IsListEmpty(&Vcb->InodeCacheLru)) {
+        return;
+    }
+
+    ExAcquireResourceExclusiveLite(&Vcb->InodeCacheLock, TRUE);
+
+    if (Vcb->InodeCacheGen != Generation) {
+        /* an invalidation raced our block read - the decoded data
+           may predate the write, so drop it */
+        ExReleaseResourceLite(&Vcb->InodeCacheLock);
+        return;
+    }
+
+    Entry = Ext2InodeCacheFindLocked(Vcb, InodeNo);
+    if (!Entry) {
+        PLIST_ENTRY Link = RemoveHeadList(&Vcb->InodeCacheLru);
+        Entry = CONTAINING_RECORD(Link, EXT2_INODE_CACHE_ENTRY, LruLink);
+        if (Entry->Valid) {
+            Ext2InodeCacheRemoveHashLocked(Vcb, Entry);
+        }
+    } else {
+        Ext2InodeCacheRemoveHashLocked(Vcb, Entry);
+        RemoveEntryList(&Entry->LruLink);
+    }
+
+    Entry->InodeNo = InodeNo;
+    Entry->Inode = *Inode;
+    Entry->Inode.i_priv = NULL;
+    Entry->Valid = TRUE;
+    Ext2InodeCacheInsertHashLocked(Vcb, Entry);
+    InsertTailList(&Vcb->InodeCacheLru, &Entry->LruLink);
+
+    ExReleaseResourceLite(&Vcb->InodeCacheLock);
+}
+
+VOID
+Ext2InitializeInodeCache(IN PEXT2_VCB Vcb)
+{
+    ULONG i;
+
+    Vcb->InodeCacheEntries = NULL;
+    Vcb->InodeCacheHash = NULL;
+    Vcb->InodeCacheCount = 0;
+    Vcb->InodeCacheHashMask = 0;
+    InitializeListHead(&Vcb->InodeCacheLru);
+
+    Vcb->InodeCacheEntries = Ext2AllocatePool(
+                                 NonPagedPool,
+                                 sizeof(EXT2_INODE_CACHE_ENTRY) * EXT2_INODE_CACHE_SIZE,
+                                 EXT2_INODE_CACHE_MAGIC);
+    Vcb->InodeCacheHash = Ext2AllocatePool(
+                              NonPagedPool,
+                              sizeof(PEXT2_INODE_CACHE_ENTRY) * EXT2_INODE_CACHE_HASH_SIZE,
+                              EXT2_INODE_CACHE_MAGIC);
+
+    if (!Vcb->InodeCacheEntries || !Vcb->InodeCacheHash) {
+        Ext2DestroyInodeCache(Vcb);
+        return;
+    }
+
+    RtlZeroMemory(Vcb->InodeCacheEntries,
+                  sizeof(EXT2_INODE_CACHE_ENTRY) * EXT2_INODE_CACHE_SIZE);
+    RtlZeroMemory(Vcb->InodeCacheHash,
+                  sizeof(PEXT2_INODE_CACHE_ENTRY) * EXT2_INODE_CACHE_HASH_SIZE);
+
+    Vcb->InodeCacheCount = EXT2_INODE_CACHE_SIZE;
+    Vcb->InodeCacheHashMask = EXT2_INODE_CACHE_HASH_SIZE - 1;
+
+    for (i = 0; i < Vcb->InodeCacheCount; i++) {
+        InsertTailList(&Vcb->InodeCacheLru, &Vcb->InodeCacheEntries[i].LruLink);
+    }
+}
+
+VOID
+Ext2DestroyInodeCache(IN PEXT2_VCB Vcb)
+{
+    if (Vcb->InodeCacheEntries) {
+        Ext2FreePool(Vcb->InodeCacheEntries, EXT2_INODE_CACHE_MAGIC);
+        Vcb->InodeCacheEntries = NULL;
+    }
+
+    if (Vcb->InodeCacheHash) {
+        Ext2FreePool(Vcb->InodeCacheHash, EXT2_INODE_CACHE_MAGIC);
+        Vcb->InodeCacheHash = NULL;
+    }
+
+    Vcb->InodeCacheCount = 0;
+    Vcb->InodeCacheHashMask = 0;
+    InitializeListHead(&Vcb->InodeCacheLru);
+}
+
+VOID
+Ext2InvalidateInodeCache(IN PEXT2_VCB Vcb, IN ULONG InodeNo)
+{
+    PEXT2_INODE_CACHE_ENTRY Entry;
+
+    if (!Vcb || !Vcb->InodeCacheEntries || !Vcb->InodeCacheHash || InodeNo == 0) {
+        return;
+    }
+
+    ExAcquireResourceExclusiveLite(&Vcb->InodeCacheLock, TRUE);
+
+    /* bump even when the inode is not cached: a concurrent block decode
+       may be about to insert it with pre-invalidation content */
+    Vcb->InodeCacheGen++;
+
+    Entry = Ext2InodeCacheFindLocked(Vcb, InodeNo);
+    if (Entry) {
+        Ext2InodeCacheRemoveHashLocked(Vcb, Entry);
+        RemoveEntryList(&Entry->LruLink);
+        RtlZeroMemory(&Entry->Inode, sizeof(struct inode));
+        Entry->InodeNo = 0;
+        Entry->Valid = FALSE;
+        InsertHeadList(&Vcb->InodeCacheLru, &Entry->LruLink);
+    }
+
+    ExReleaseResourceLite(&Vcb->InodeCacheLock);
+}
+
+VOID
+Ext2InvalidateInodeCacheAll(IN PEXT2_VCB Vcb)
+{
+    ULONG i;
+
+    if (!Vcb || !Vcb->InodeCacheEntries || !Vcb->InodeCacheHash) {
+        return;
+    }
+
+    ExAcquireResourceExclusiveLite(&Vcb->InodeCacheLock, TRUE);
+
+    Vcb->InodeCacheGen++;
+
+    RtlZeroMemory(Vcb->InodeCacheHash,
+                  sizeof(PEXT2_INODE_CACHE_ENTRY) * (Vcb->InodeCacheHashMask + 1));
+
+    for (i = 0; i < Vcb->InodeCacheCount; i++) {
+        Vcb->InodeCacheEntries[i].Valid = FALSE;
+        Vcb->InodeCacheEntries[i].InodeNo = 0;
+        Vcb->InodeCacheEntries[i].HashNext = NULL;
+    }
+
+    ExReleaseResourceLite(&Vcb->InodeCacheLock);
+}
+
+VOID
+Ext2InvalidateRawVolumeCaches(IN PEXT2_VCB Vcb)
+{
+    if (!Vcb) {
+        return;
+    }
+
+    /* Drop buffer heads after raw I/O so a subsequent inode decode cannot
+       reuse a pre-write inode-table block. */
+    ExAcquireResourceExclusiveLite(&Vcb->sbi.s_gd_lock, TRUE);
+    Ext2DropBH(Vcb);
+    Ext2InvalidateInodeCacheAll(Vcb);
+    ExReleaseResourceLite(&Vcb->sbi.s_gd_lock);
+}
+
+static BOOLEAN
+Ext2LookupInodeCache(IN PEXT2_VCB Vcb, IN ULONG InodeNo, OUT struct inode *Inode)
+{
+    PEXT2_INODE_CACHE_ENTRY Entry;
+
+    if (!Vcb->InodeCacheEntries || !Vcb->InodeCacheHash || InodeNo == 0) {
+        return FALSE;
+    }
+
+    ExAcquireResourceExclusiveLite(&Vcb->InodeCacheLock, TRUE);
+
+    Entry = Ext2InodeCacheFindLocked(Vcb, InodeNo);
+    if (Entry) {
+        Ext2InodeCacheCopyOut(Inode, &Entry->Inode);
+        RemoveEntryList(&Entry->LruLink);
+        InsertTailList(&Vcb->InodeCacheLru, &Entry->LruLink);
+        ExReleaseResourceLite(&Vcb->InodeCacheLock);
+        return TRUE;
+    }
+
+    ExReleaseResourceLite(&Vcb->InodeCacheLock);
+    return FALSE;
+}
+
 BOOLEAN
 Ext2GetInodeLba (
     IN PEXT2_VCB    Vcb,
@@ -583,6 +853,107 @@ Ext2LoadInode (IN PEXT2_VCB Vcb,
 }
 
 BOOLEAN
+Ext2LoadInodeCached(IN PEXT2_VCB Vcb,
+                    IN struct inode *Inode)
+{
+    PUCHAR                  raw = NULL;
+    LONGLONG                offset;
+    LONGLONG                blockOffset;
+    ULONG                   inodeNo;
+    ULONG                   firstInode;
+    ULONG                   inodeIndex;
+    ULONG                   inodesPerBlock;
+    ULONG                   firstIndexInGroup;
+    ULONG                   i;
+    ULONG                   generation;
+    BOOLEAN                 found = FALSE;
+
+    if (!Vcb || !Inode || Inode->i_ino == 0) {
+        return FALSE;
+    }
+
+    if (!Vcb->InodeCacheEntries || !Vcb->InodeCacheHash) {
+        return Ext2LoadInode(Vcb, Inode);
+    }
+
+    inodeNo = Inode->i_ino;
+
+    if (Ext2LookupInodeCache(Vcb, inodeNo, Inode)) {
+        return TRUE;
+    }
+
+    if (!Ext2GetInodeLba(Vcb, inodeNo, &offset)) {
+        DEBUG(DL_ERR, ("Ext2LoadInodeCached: failed inode %u.\n", inodeNo));
+        return FALSE;
+    }
+
+    if (Vcb->InodeSize == 0 || Vcb->InodeSize > BLOCK_SIZE ||
+        (BLOCK_SIZE % Vcb->InodeSize) != 0) {
+        return Ext2LoadInode(Vcb, Inode);
+    }
+
+    blockOffset = offset & ~((LONGLONG)BLOCK_SIZE - 1);
+    inodeIndex = (ULONG)((offset - blockOffset) / Vcb->InodeSize);
+    firstInode = inodeNo - inodeIndex;
+    inodesPerBlock = BLOCK_SIZE / Vcb->InodeSize;
+    firstIndexInGroup = (firstInode - 1) % INODES_PER_GROUP;
+
+    ExAcquireResourceSharedLite(&Vcb->InodeCacheLock, TRUE);
+    generation = Vcb->InodeCacheGen;
+    ExReleaseResourceLite(&Vcb->InodeCacheLock);
+
+    raw = Ext2AllocatePool(NonPagedPool, BLOCK_SIZE, EXT2_INODE_MAGIC);
+    if (!raw) {
+        return Ext2LoadInode(Vcb, Inode);
+    }
+
+    if (!Ext2LoadBuffer(NULL, Vcb, blockOffset, BLOCK_SIZE, raw)) {
+        Ext2FreePool(raw, EXT2_INODE_MAGIC);
+        return Ext2LoadInode(Vcb, Inode);
+    }
+
+    for (i = 0; i < inodesPerBlock; i++) {
+        struct inode tmp = {0};
+        struct ext4_inode *rawInode;
+        ULONG currentInode = firstInode + i;
+
+        /* the tail of a group's last inode-table block may be padding;
+           those slots do not map to the next group's inode numbers */
+        if (firstIndexInGroup + i >= INODES_PER_GROUP) {
+            break;
+        }
+
+        if (currentInode < 1 || currentInode > INODES_COUNT) {
+            continue;
+        }
+
+        rawInode = (struct ext4_inode *)(raw + i * Vcb->InodeSize);
+        tmp.i_ino = currentInode;
+        tmp.i_sb = &Vcb->sb;
+        Ext2DecodeInode(&tmp, rawInode);
+
+        if (currentInode == inodeNo) {
+            struct ext4_inode_info unused = {0};
+            ext4_inode_csum_verify(&tmp, rawInode, &unused);
+            Ext2InodeCacheCopyOut(Inode, &tmp);
+            found = TRUE;
+            Ext2InodeCacheStore(Vcb, currentInode, &tmp, generation);
+        } else if (rawInode->i_mode != 0 || rawInode->i_links_count != 0) {
+            /* don't waste cache slots on free inode records */
+            Ext2InodeCacheStore(Vcb, currentInode, &tmp, generation);
+        }
+    }
+
+    Ext2FreePool(raw, EXT2_INODE_MAGIC);
+
+    if (found) {
+        return TRUE;
+    }
+
+    return Ext2LoadInode(Vcb, Inode);
+}
+
+BOOLEAN
 Ext2ClearInode (
     IN PEXT2_IRP_CONTEXT IrpContext,
     IN PEXT2_VCB Vcb,
@@ -591,6 +962,8 @@ Ext2ClearInode (
     LONGLONG            Offset = 0;
     BOOLEAN             rc;
 
+    Ext2InvalidateInodeCache(Vcb, Inode);
+
     rc = Ext2GetInodeLba(Vcb, Inode, &Offset);
     if (!rc)  {
         DEBUG(DL_ERR, ( "Ext2SaveInode: failed inode %u.\n", Inode));
@@ -598,6 +971,9 @@ Ext2ClearInode (
     }
 
     rc = Ext2ZeroBuffer(IrpContext, Vcb, Offset, Vcb->InodeSize);
+    if (rc) {
+        Ext2InvalidateInodeCache(Vcb, Inode);
+    }
 
 errorout:
 
@@ -613,6 +989,10 @@ Ext2SaveInode ( IN PEXT2_IRP_CONTEXT IrpContext,
     struct ext4_inode_info  unused = {0};
     LONGLONG                offset;
     BOOLEAN                 rc = 0;
+
+    if (Inode) {
+        Ext2InvalidateInodeCache(Vcb, Inode->i_ino);
+    }
 
     DEBUG(DL_INF, ( "Ext2SaveInode: Saving Inode %xh: Mode=%xh Size=%xh\n",
                     Inode->i_ino, Inode->i_mode, Inode->i_size));
@@ -643,6 +1023,10 @@ Ext2SaveInode ( IN PEXT2_IRP_CONTEXT IrpContext,
     ext4_inode_csum_set(Inode, ext4i, &unused);
 
     rc = Ext2SaveBuffer(IrpContext, Vcb, offset, EXT4_INODE_SIZE(Inode->i_sb), ext4i);
+
+    if (rc) {
+        Ext2InvalidateInodeCache(Vcb, Inode->i_ino);
+    }
 
     ExReleaseResourceLite(&Vcb->sbi.s_gd_lock);
 
@@ -715,6 +1099,8 @@ Ext2SaveInodeXattr(IN PEXT2_IRP_CONTEXT IrpContext,
 									Offset + EXT2_GOOD_OLD_INODE_SIZE + Inode->i_extra_isize,
 									InodeSize - EXT2_GOOD_OLD_INODE_SIZE - Inode->i_extra_isize,
 									(char *)InodeXattr + EXT2_GOOD_OLD_INODE_SIZE + Inode->i_extra_isize);
+
+	Ext2InvalidateInodeCache(Vcb, Inode->i_ino);
 
 	if (rc && IsFlagOn(Vcb->Flags, VCB_FLOPPY_DISK)) {
 		Ext2StartFloppyFlushDpc(Vcb, NULL, NULL);
@@ -995,15 +1381,26 @@ Ext2SaveBuffer( IN PEXT2_IRP_CONTEXT    IrpContext,
     return rc;
 }
 
+static
 VOID
-Ext2UpdateVcbStat(
-    IN PEXT2_IRP_CONTEXT    IrpContext,
-    IN PEXT2_VCB            Vcb
+Ext2ApplyGroupBlkDelta(
+    IN PEXT2_VCB            Vcb,
+    IN ext3_fsblk_t         OldFree,
+    IN ext3_fsblk_t         NewFree
 )
 {
-    Vcb->SuperBlock->s_free_inodes_count = ext4_count_free_inodes(&Vcb->sb);
-    ext3_free_blocks_count_set(SUPER_BLOCK, ext4_count_free_blocks(&Vcb->sb));
-    Ext2SaveSuper(IrpContext, Vcb);
+    ext3_fsblk_t GFree = ext3_free_blocks_count(Vcb->SuperBlock);
+
+    if (NewFree > OldFree) {
+        ext3_free_blocks_count_set(Vcb->SuperBlock, GFree + (NewFree - OldFree));
+    } else if (OldFree > NewFree) {
+        ext3_fsblk_t Delta = OldFree - NewFree;
+        if (GFree > Delta) {
+            ext3_free_blocks_count_set(Vcb->SuperBlock, GFree - Delta);
+        } else {
+            ext3_free_blocks_count_set(Vcb->SuperBlock, 0);
+        }
+    }
 }
 
 NTSTATUS
@@ -1183,20 +1580,9 @@ Again:
         {
             ext3_fsblk_t OldFree = ext4_free_blks_count(sb, gd);
             ULONG NewFree = RtlNumberOfClearBits(&BlockBitmap);
-            ext3_fsblk_t FreeBlocks = ext3_free_blocks_count(SUPER_BLOCK);
 
             ext4_free_blks_set(sb, gd, (__u32)NewFree);
-
-            if (OldFree > NewFree) {
-                ext3_fsblk_t Delta = OldFree - NewFree;
-                if (FreeBlocks > Delta) {
-                    ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks - Delta);
-                } else {
-                    ext3_free_blocks_count_set(SUPER_BLOCK, 0);
-                }
-            } else if (NewFree > OldFree) {
-                ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks + (NewFree - OldFree));
-            }
+            Ext2ApplyGroupBlkDelta(Vcb, OldFree, (ext3_fsblk_t)NewFree);
             Ext2SaveSuper(IrpContext, Vcb);
         }
         ext4_block_bitmap_csum_set(sb, Group, gd, bh);
@@ -1349,19 +1735,9 @@ Again:
         {
             ext3_fsblk_t OldFree = ext4_free_blks_count(sb, gd);
             ULONG NewFree = RtlNumberOfClearBits(&BlockBitmap);
-            ext3_fsblk_t FreeBlocks = ext3_free_blocks_count(SUPER_BLOCK);
 
             ext4_free_blks_set(sb, gd, (__u32)NewFree);
-            if (NewFree > OldFree) {
-                ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks + (NewFree - OldFree));
-            } else if (OldFree > NewFree) {
-                ext3_fsblk_t Delta = OldFree - NewFree;
-                if (FreeBlocks > Delta) {
-                    ext3_free_blocks_count_set(SUPER_BLOCK, FreeBlocks - Delta);
-                } else {
-                    ext3_free_blocks_count_set(SUPER_BLOCK, 0);
-                }
-            }
+            Ext2ApplyGroupBlkDelta(Vcb, OldFree, (ext3_fsblk_t)NewFree);
             Ext2SaveSuper(IrpContext, Vcb);
         }
 
@@ -1747,6 +2123,8 @@ repeat:
                 /* recheck and clear flag under lock if we still need to */
                 block_bitmap_bh = sb_getblk_zero(sb, ext4_block_bitmap(sb, gd));
                 if (block_bitmap_bh) {
+                    ext3_fsblk_t OldFree = ext4_free_blks_count(sb, gd);
+
                     ext4_group_desc_csum_set(&Vcb->sb, Group, gd);
                     free = ext4_init_block_bitmap(sb, block_bitmap_bh, Group, gd);
                     ext4_block_bitmap_csum_set(sb, Group, gd, block_bitmap_bh);
@@ -1754,12 +2132,16 @@ repeat:
                     brelse(block_bitmap_bh);
                     gd->bg_flags &= cpu_to_le16(~EXT4_BG_BLOCK_UNINIT);
                     ext4_free_blks_set(sb, gd, free);
+
+                    Ext2ApplyGroupBlkDelta(Vcb, OldFree, (ext3_fsblk_t)free);
+                    Ext2SaveSuper(IrpContext, Vcb);
                     Ext2SaveGroup(IrpContext, Vcb, Group);
                 }
             }
         }
 
         *Inode = dwInode + 1 + Group * INODES_PER_GROUP;
+        Ext2InvalidateInodeCache(Vcb, *Inode);
 
         /* update group_desc / super_block */
         if (Type == EXT2_FT_DIR) {
@@ -1767,7 +2149,10 @@ repeat:
         }
         ext4_inode_bitmap_csum_set(sb, Group, gd, bh, EXT4_INODES_PER_GROUP(sb) / 8);
         Ext2SaveGroup(IrpContext, Vcb, Group);
-        Ext2UpdateVcbStat(IrpContext, Vcb);
+
+        Vcb->SuperBlock->s_free_inodes_count =
+            cpu_to_le32(le32_to_cpu(Vcb->SuperBlock->s_free_inodes_count) - 1);
+        Ext2SaveSuper(IrpContext, Vcb);
         Status = STATUS_SUCCESS;
     }
 
@@ -1808,7 +2193,6 @@ Ext2UpdateGroupDirStat(
     /* update group_desc and super_block */
     ext4_used_dirs_set(sb, gd, ext4_used_dirs_count(sb, gd) - 1);
     Ext2SaveGroup(IrpContext, Vcb, group);
-    Ext2UpdateVcbStat(IrpContext, Vcb);
     status = STATUS_SUCCESS;
 
 errorout:
@@ -1846,6 +2230,8 @@ Ext2FreeInode(
     NTSTATUS        Status = STATUS_UNSUCCESSFUL;
 
     ExAcquireResourceExclusiveLite(&Vcb->MetaInode, TRUE);
+
+    Ext2InvalidateInodeCache(Vcb, Inode);
 
     Group = (Inode - 1) / INODES_PER_GROUP;
     dwIno = (Inode - 1) % INODES_PER_GROUP;
@@ -1917,7 +2303,10 @@ Ext2FreeInode(
         }
         ext4_inode_bitmap_csum_set(sb, Group, gd, bh, EXT4_INODES_PER_GROUP(sb) / 8);
         Ext2SaveGroup(IrpContext, Vcb, Group);
-        Ext2UpdateVcbStat(IrpContext, Vcb);
+
+        Vcb->SuperBlock->s_free_inodes_count =
+            cpu_to_le32(le32_to_cpu(Vcb->SuperBlock->s_free_inodes_count) + 1);
+        Ext2SaveSuper(IrpContext, Vcb);
         Status = STATUS_SUCCESS;
     }
 
@@ -1948,6 +2337,7 @@ Ext2AddEntry (
 
     NTSTATUS                status = STATUS_UNSUCCESSFUL;
     OEM_STRING              oem;
+    ULONG                   NameLength;
     int                     rc;
 
     BOOLEAN                 MainResourceAcquired = FALSE;
@@ -1955,6 +2345,11 @@ Ext2AddEntry (
     if (!IsDirectory(Dcb)) {
         DbgBreak();
         return STATUS_NOT_A_DIRECTORY;
+    }
+
+    NameLength = Ext2UnicodeToOEMSize(Vcb, FileName);
+    if (NameLength == 0 || NameLength > EXT2_NAME_LEN) {
+        return STATUS_OBJECT_NAME_INVALID;
     }
 
     ExAcquireResourceExclusiveLite(&Dcb->MainResource, TRUE);

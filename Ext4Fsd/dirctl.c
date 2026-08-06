@@ -120,6 +120,22 @@ Ext2ProcessEntry(
         }
     }
 
+    if (FileInformationClass == FileNamesInformation) {
+        FNI = (PFILE_NAMES_INFORMATION) ((PUCHAR)Buffer + UsedLength);
+        if (!Single) {
+            FNI->NextEntryOffset = CEILING_ALIGNED(ULONG, InfoLength + NameLength, 8);
+        }
+
+        FNI->FileNameLength = NameLength;
+        if (InfoLength + NameLength > Length) {
+            NameLength = Length - InfoLength;
+        }
+        RtlCopyMemory(&FNI->FileName[0], &pName->Buffer[0], NameLength);
+
+        *EntrySize = InfoLength + NameLength;
+        return Status;
+    }
+
     DEBUG(DL_CP, ("Ext2ProcessDirEntry: %wZ in %wZ\n", pName, &Dcb->Mcb->FullName ));
 
     Mcb = Ext2SearchMcb(Vcb, Dcb->Mcb, pName);
@@ -132,7 +148,7 @@ Ext2ProcessEntry(
 
         Inode.i_ino = in;
         Inode.i_sb = &Vcb->sb;
-        if (!Ext2LoadInode(Vcb, &Inode)) {
+        if (!Ext2LoadInodeCached(Vcb, &Inode)) {
             DEBUG(DL_ERR, ("Ext2PricessDirEntry: Loading inode %xh (%wZ) error.\n",
                            in, pName ));
             DbgBreak();

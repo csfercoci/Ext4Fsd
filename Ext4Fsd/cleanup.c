@@ -28,6 +28,7 @@ Ext2Cleanup (IN PEXT2_IRP_CONTEXT IrpContext)
     PEXT2_CCB       Ccb = NULL;
     PIRP            Irp = NULL;
     PEXT2_MCB       Mcb = NULL;
+    IO_STATUS_BLOCK FlushStatus;
 
     BOOLEAN         VcbResourceAcquired = FALSE;
     BOOLEAN         FcbResourceAcquired = FALSE;
@@ -293,8 +294,12 @@ Ext2Cleanup (IN PEXT2_IRP_CONTEXT IrpContext)
                     (Fcb->SectionObject.DataSectionObject != NULL)) {
 
                 if (!IsVcbReadOnly(Vcb)) {
-                    CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
-                    ClearLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                    RtlZeroMemory(&FlushStatus, sizeof(FlushStatus));
+                    CcFlushCache(&Fcb->SectionObject, NULL, 0, &FlushStatus);
+                    if (NT_SUCCESS(FlushStatus.Status)) {
+                        Ext2ResetOrderedDirtyRanges(Fcb);
+                        ClearLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                    }
                 }
 
                 /* purge cache if all remaining openings are non-cached */

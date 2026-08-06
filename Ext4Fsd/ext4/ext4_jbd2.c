@@ -31,6 +31,7 @@ struct ext4_handle {
     struct super_block  *sb;
     int                 nrevoked;
     __u64               revoked[MAX_HANDLE_REVOKES];
+    struct ext4_handle  *NextPending;
 };
 
 static handle_t no_journal;
@@ -38,6 +39,19 @@ static handle_t no_journal;
 static struct ext4_handle *to_eh(handle_t *handle)
 {
     return (struct ext4_handle *)((char *)handle - FIELD_OFFSET(struct ext4_handle, h));
+}
+
+static int ext4_handle_has_revoke(struct ext4_handle *eh, __u64 blocknr)
+{
+    int i;
+
+    for (i = 0; i < eh->nrevoked; i++) {
+        if (eh->revoked[i] == blocknr) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static int journal_wait_for_writes(struct buffer_head **bufs, int nbufs)
@@ -450,7 +464,7 @@ static void ext4_handle_release_buffers(struct ext4_handle *eh)
 
 /* ==================== Public API ==================== */
 
-static void Ext2FlushDirtyData(PEXT2_VCB Vcb);
+static NTSTATUS Ext2FlushDirtyData(PEXT2_VCB Vcb);
 
 handle_t *__ext4_journal_start_sb(void *icb, struct super_block *sb, unsigned int line,
                   int type, int blocks, int rsv_blocks)
@@ -484,10 +498,9 @@ handle_t *__ext4_journal_start_sb(void *icb, struct super_block *sb, unsigned in
 int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_t *handle)
 {
     struct ext4_handle *eh;
-    struct ext4_handle *pending;
+    struct ext4_handle *tail;
     PEXT2_IRP_CONTEXT IrpContext;
     PEXT2_VCB Vcb;
-    int err = 0;
     int i, j;
 
     if (!ext4_handle_valid(handle))
@@ -521,54 +534,50 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
     }
 
     if (Vcb) {
-        journal_t *journal = eh->journal;
         LARGE_INTEGER batchDue;
+        BOOLEAN wakeNow = FALSE;
 
-        mutex_lock(&journal->j_checkpoint_mutex);
-        pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
+        mutex_lock(&eh->journal->j_checkpoint_mutex);
+        tail = (struct ext4_handle *)Vcb->PendingJournalTail;
 
         /* Defensive ownership check: this handle is ALREADY the pending
          * handle.  That means __ext4_journal_stop reached the same eh twice
          * (double-stop / aliased IrpContext->Handle).  Merging or freeing it
-         * here would leave Vcb->PendingJournalHandle pointing at freed heap,
+         * here would leave the pending FIFO pointing at freed heap,
          * and kjournald would free it a second time -> Ext2FreePool guard
          * corruption -> int 3 (BSOD 0x7E).  The handle is already owned by
-         * the pending slot; drop this redundant stop and let kjournald
+         * the pending queue; drop this redundant stop and let kjournald
          * commit/free it exactly once. */
-        if (pending == eh) {
-            mutex_unlock(&journal->j_checkpoint_mutex);
-            return 0;
-        }
+        {
+            struct ext4_handle *queued;
 
-        if (pending == NULL) {
-            /* Become the pending handle -- don't commit yet. */
-            Vcb->PendingJournalHandle = (void *)eh;
-            mutex_unlock(&journal->j_checkpoint_mutex);
-            /* Arm batch timer: commit after BatchDelayMs */
-            if (Vcb->KjournaldThread && !Vcb->BatchTimerArmed) {
-                batchDue.QuadPart = (LONGLONG)-10 * 1000 * EXT2_BATCH_DELAY_MS;
-                KeSetTimer(&Vcb->BatchTimer, batchDue, &Vcb->BatchDpc);
-                Vcb->BatchTimerArmed = TRUE;
+            for (queued = (struct ext4_handle *)Vcb->PendingJournalHandle;
+                 queued != NULL;
+                 queued = queued->NextPending) {
+                if (queued == eh) {
+                    mutex_unlock(&eh->journal->j_checkpoint_mutex);
+                    return 0;
+                }
             }
-            return 0;
         }
 
-        if ((pending->nbuffers + eh->nbuffers) <= MAX_HANDLE_BUFFERS &&
-            (pending->nrevoked + eh->nrevoked) <= MAX_HANDLE_REVOKES) {
+        if (tail &&
+            (tail->nbuffers + eh->nbuffers) <= MAX_HANDLE_BUFFERS &&
+            (tail->nrevoked + eh->nrevoked) <= MAX_HANDLE_REVOKES) {
 
             /* Merge buffers (deduplicated).  Each eh buffer carries one
-             * get_bh reference: transfer it to pending for non-duplicates,
-             * release it for duplicates (pending already holds a ref). */
+             * get_bh reference: transfer it to tail for non-duplicates,
+             * release it for duplicates (tail already holds a ref). */
             for (i = 0; i < eh->nbuffers; i++) {
                 int dup = 0;
-                for (j = 0; j < pending->nbuffers; j++) {
-                    if (pending->buffers[j] == eh->buffers[i]) {
+                for (j = 0; j < tail->nbuffers; j++) {
+                    if (tail->buffers[j] == eh->buffers[i]) {
                         dup = 1;
                         break;
                     }
                 }
                 if (!dup)
-                    pending->buffers[pending->nbuffers++] = eh->buffers[i];
+                    tail->buffers[tail->nbuffers++] = eh->buffers[i];
                 else
                     put_bh(eh->buffers[i]);
             }
@@ -576,62 +585,48 @@ int __ext4_journal_stop(const char *where, unsigned int line, void *icb, handle_
             eh->nbuffers = 0;
 
             /* Merge revokes */
-            for (i = 0; i < eh->nrevoked; i++)
-                pending->revoked[pending->nrevoked++] = eh->revoked[i];
+            for (i = 0; i < eh->nrevoked; i++) {
+                if (!ext4_handle_has_revoke(tail, eh->revoked[i])) {
+                    tail->revoked[tail->nrevoked++] = eh->revoked[i];
+                }
+            }
 
-            mutex_unlock(&journal->j_checkpoint_mutex);
+            mutex_unlock(&eh->journal->j_checkpoint_mutex);
             kfree(eh);
-            /* Timer already armed from first stop — don't re-arm */
             return 0;
         }
 
-        /* Pending handle full -- swap eh in as the new pending atomically
-         * (single critical section) and commit the evicted one.  eh is a
-         * fully-formed, finished handle (h_ref == 0), so it's safe for
-         * kjournald to grab and commit it immediately if woken.
-         *
-         * Splitting this into "NULL out, unlock, ... , lock, install eh"
-         * leaves a window where another __ext4_journal_stop can claim the
-         * NULL slot; this swap then clobbers that handle, leaking it and
-         * silently dropping its journal entries (corruption).
-         *
-         * Data=ordered: flush dirty file data before committing metadata
-         * so that data blocks are on disk before metadata references them. */
-        Vcb->PendingJournalHandle = (void *)eh;
-        mutex_unlock(&journal->j_checkpoint_mutex);
-
-        Ext2FlushDirtyData(Vcb);
-        err = journal_commit_sync(pending);
-        ext4_handle_release_buffers(pending);
-        kfree(pending);
-
-        if (err)
-            printk(KERN_ERR "Ext4Fsd: journal commit failed: %d\n", err);
-        InterlockedExchange(&Vcb->JournalCommitError, err);
-
-        /* Bump sequence so any racing Ext2JournalForceCommit sees
-         * the commit is done (the overflow path runs in the caller's
-         * thread which may hold Fcb locks — deadlock-free because
-         * ForceCommit no longer commits inline).  Bumped on failure
-         * too: waiters must wake instead of timing out, and they read
-         * JournalCommitError to learn the outcome. */
-        InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
-
-        /* Arm batch timer for the new pending handle */
-        if (Vcb->KjournaldThread && !Vcb->BatchTimerArmed) {
-            LARGE_INTEGER batchDue;
-            batchDue.QuadPart = (LONGLONG)-10 * 1000 * EXT2_BATCH_DELAY_MS;
-            KeSetTimer(&Vcb->BatchTimer, batchDue, &Vcb->BatchDpc);
-            Vcb->BatchTimerArmed = TRUE;
+        /* The tail is full.  Queue this transaction and wake kjournald rather
+           than making the mutating caller flush data or commit metadata. */
+        eh->NextPending = NULL;
+        if (tail) {
+            tail->NextPending = eh;
+            wakeNow = TRUE;
+        } else {
+            Vcb->PendingJournalHandle = eh;
         }
-        return err;
+        Vcb->PendingJournalTail = eh;
+        mutex_unlock(&eh->journal->j_checkpoint_mutex);
+
+        if (Vcb->KjournaldThread) {
+            if (wakeNow) {
+                KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
+            } else if (!Vcb->BatchTimerArmed) {
+                batchDue.QuadPart = (LONGLONG)-10 * 1000 * EXT2_BATCH_DELAY_MS;
+                KeSetTimer(&Vcb->BatchTimer, batchDue, &Vcb->BatchDpc);
+                Vcb->BatchTimerArmed = TRUE;
+            }
+        }
+        return 0;
     }
 
     /* No VCB context -- commit immediately (safety fallback). */
-    err = journal_commit_sync(eh);
-    ext4_handle_release_buffers(eh);
-    kfree(eh);
-    return err;
+    {
+        int err = journal_commit_sync(eh);
+        ext4_handle_release_buffers(eh);
+        kfree(eh);
+        return err;
+    }
 }
 
 void ext4_journal_abort_handle(const char *caller, unsigned int line,
@@ -711,16 +706,14 @@ int __ext4_handle_dirty_super(const char *where, unsigned int line,
 int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
 {
     struct ext4_handle *eh;
-    int i;
 
     if (!ext4_handle_valid(handle))
         return 0;
 
     eh = to_eh(handle);
 
-    for (i = 0; i < eh->nrevoked; i++) {
-        if (eh->revoked[i] == (__u64)blocknr)
-            return 0;
+    if (ext4_handle_has_revoke(eh, (__u64)blocknr)) {
+        return 0;
     }
 
     if (eh->nrevoked >= MAX_HANDLE_REVOKES) {
@@ -757,16 +750,62 @@ int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
  * to 0 here stays on FcbList with its old TsDrop until the reaper
  * frees it.
  */
-static void
+static NTSTATUS
+Ext2FlushOrderedDirtyRanges(PEXT2_FCB Fcb)
+{
+    EXT2_ORDERED_DIRTY_RANGE Ranges[EXT2_ORDERED_DIRTY_RANGE_COUNT];
+    LARGE_INTEGER Offset;
+    KIRQL Irql;
+    ULONG Count;
+    ULONG i;
+
+    KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
+    Count = Fcb->OrderedDirtyRangeCount;
+    RtlCopyMemory(Ranges, Fcb->OrderedDirtyRanges,
+                  Count * sizeof(EXT2_ORDERED_DIRTY_RANGE));
+    Fcb->OrderedDirtyRangeCount = 0;
+    KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
+
+    for (i = 0; i < Count; i++) {
+        LONGLONG Pos = Ranges[i].Start;
+
+        while (Pos < Ranges[i].End) {
+            IO_STATUS_BLOCK IoStatus = {0};
+            ULONG Length;
+            LONGLONG Remaining = Ranges[i].End - Pos;
+
+            Length = (Remaining > (LONGLONG)(256 * 1024 * 1024)) ?
+                     (256 * 1024 * 1024) : (ULONG)Remaining;
+            Offset.QuadPart = Pos;
+            CcFlushCache(&Fcb->SectionObject, &Offset, Length, &IoStatus);
+            if (!NT_SUCCESS(IoStatus.Status)) {
+                ULONG j;
+
+                /* Preserve every range for a later ordered-data retry. */
+                for (j = 0; j < Count; j++) {
+                    Ext2MarkOrderedDirtyRange(Fcb, Ranges[j].Start, Ranges[j].End);
+                }
+                return IoStatus.Status;
+            }
+            Pos += Length;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 Ext2FlushDirtyData(PEXT2_VCB Vcb)
 {
     PEXT2_FCB Fcb;
     PLIST_ENTRY ListEntry;
     LIST_ENTRY FlushList;
     PEXT2_FLUSH_FCB_ENTRY Entry;
+    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS FlushStatus;
 
     if (IsVcbReadOnly(Vcb))
-        return;
+        return STATUS_SUCCESS;
 
     InitializeListHead(&FlushList);
 
@@ -784,23 +823,20 @@ Ext2FlushDirtyData(PEXT2_VCB Vcb)
             continue;
         if (Fcb->SectionObject.DataSectionObject == NULL)
             continue;
-        /* Ordered mode only needs files whose data was actually written
-         * since the last flush; flushing every open FCB on every commit
-         * costs a synchronous CcFlushCache per file.  FCB_FILE_MODIFIED is
-         * set by Ext2WriteFile/SetInformation before their metadata reaches
-         * a journal handle, so a commit can never see the metadata without
-         * also seeing the flag.  Deliberately NOT cleared here: the clear
-         * points (flush/cleanup/purge) do their own CcFlushCache first. */
+        /* Ordered mode only needs ranges whose data was actually written
+         * since the last ordered flush.  Flushing the whole file on every
+         * commit rewrites the same growing copy target over and over. */
         if (!IsFlagOn(Fcb->Flags, FCB_FILE_MODIFIED))
             continue;
 
         Entry = Ext2AllocatePool(NonPagedPool, sizeof(EXT2_FLUSH_FCB_ENTRY),
                                  EXT2_FLIST_MAGIC);
         if (!Entry) {
-            /* Can't defer this one: flush inline under the lock (the old
-             * behavior).  Skipping it would let metadata commit ahead of
-             * its data and break data=ordered semantics. */
-            CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
+            /* Can't defer this one: flush inline. */
+            FlushStatus = Ext2FlushOrderedDirtyRanges(Fcb);
+            if (NT_SUCCESS(Status) && !NT_SUCCESS(FlushStatus)) {
+                Status = FlushStatus;
+            }
             continue;
         }
 
@@ -818,10 +854,85 @@ Ext2FlushDirtyData(PEXT2_VCB Vcb)
         Fcb = Entry->Fcb;
         Ext2FreePool(Entry, EXT2_FLIST_MAGIC);
 
-        CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
+        FlushStatus = Ext2FlushOrderedDirtyRanges(Fcb);
+        if (NT_SUCCESS(Status) && !NT_SUCCESS(FlushStatus)) {
+            Status = FlushStatus;
+        }
 
         Ext2DerefXcb(&Fcb->ReferenceCount);
     }
+
+    return Status;
+}
+
+static struct ext4_handle *
+Ext2TakePendingJournalHandle(PEXT2_VCB Vcb, journal_t *journal)
+{
+    struct ext4_handle *pending;
+
+    mutex_lock(&journal->j_checkpoint_mutex);
+    pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
+    if (pending) {
+        Vcb->PendingJournalHandle = pending->NextPending;
+        if (Vcb->PendingJournalHandle == NULL) {
+            Vcb->PendingJournalTail = NULL;
+        }
+        pending->NextPending = NULL;
+        Vcb->JournalCommitActive++;
+    }
+    mutex_unlock(&journal->j_checkpoint_mutex);
+
+    return pending;
+}
+
+static VOID
+Ext2FinishPendingJournalHandle(PEXT2_VCB Vcb, journal_t *journal)
+{
+    mutex_lock(&journal->j_checkpoint_mutex);
+    ASSERT(Vcb->JournalCommitActive > 0);
+    Vcb->JournalCommitActive--;
+    mutex_unlock(&journal->j_checkpoint_mutex);
+}
+
+static VOID
+Ext2RequeueJournalHandleFront(
+    PEXT2_VCB Vcb,
+    journal_t *journal,
+    struct ext4_handle *pending
+)
+{
+    mutex_lock(&journal->j_checkpoint_mutex);
+    pending->NextPending = (struct ext4_handle *)Vcb->PendingJournalHandle;
+    Vcb->PendingJournalHandle = pending;
+    if (Vcb->PendingJournalTail == NULL) {
+        Vcb->PendingJournalTail = pending;
+    }
+    mutex_unlock(&journal->j_checkpoint_mutex);
+}
+
+static BOOLEAN
+Ext2CommitPendingJournalHandle(
+    PEXT2_VCB Vcb,
+    journal_t *journal,
+    struct ext4_handle *pending,
+    OUT int *err
+)
+{
+    NTSTATUS Status = Ext2FlushDirtyData(Vcb);
+
+    if (!NT_SUCCESS(Status)) {
+        /* data=ordered: never emit the metadata commit record first */
+        Ext2RequeueJournalHandleFront(Vcb, journal, pending);
+        Ext2FinishPendingJournalHandle(Vcb, journal);
+        *err = Ext2LinuxError(Status);
+        return FALSE;
+    }
+
+    *err = journal_commit_sync(pending);
+    ext4_handle_release_buffers(pending);
+    kfree(pending);
+    Ext2FinishPendingJournalHandle(Vcb, journal);
+    return TRUE;
 }
 
 /*
@@ -841,21 +952,11 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
     if (!journal)
         return;
 
-    mutex_lock(&journal->j_checkpoint_mutex);
-    pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
-    if (pending) {
-        Vcb->PendingJournalHandle = NULL;
-    }
-    mutex_unlock(&journal->j_checkpoint_mutex);
-
-    if (pending) {
+    while ((pending = Ext2TakePendingJournalHandle(Vcb, journal)) != NULL) {
         int err;
+        BOOLEAN committed;
 
-        /* Data=ordered: flush file data before metadata commit */
-        Ext2FlushDirtyData(Vcb);
-        err = journal_commit_sync(pending);
-        ext4_handle_release_buffers(pending);
-        kfree(pending);
+        committed = Ext2CommitPendingJournalHandle(Vcb, journal, pending, &err);
 
         if (err)
             printk(KERN_ERR "Ext4Fsd: journal commit failed: %d\n", err);
@@ -865,6 +966,10 @@ void Ext2JournalFlushPending(PEXT2_VCB Vcb)
          * (on failure too -- the waiter reads JournalCommitError). */
         InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
         KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+
+        if (!committed) {
+            break;
+        }
     }
 }
 
@@ -930,22 +1035,11 @@ Ext2KjournaldThread(PVOID Context)
         if (Vcb->KjournaldStop)
             break;
 
-        /* Swap out the pending handle under lock */
-        mutex_lock(&journal->j_checkpoint_mutex);
-        pending = (struct ext4_handle *)Vcb->PendingJournalHandle;
-        if (pending) {
-            Vcb->PendingJournalHandle = NULL;
-        }
-        mutex_unlock(&journal->j_checkpoint_mutex);
-
-        if (pending) {
+        while ((pending = Ext2TakePendingJournalHandle(Vcb, journal)) != NULL) {
             int err;
+            BOOLEAN committed;
 
-            /* Data=ordered: flush file data before metadata commit */
-            Ext2FlushDirtyData(Vcb);
-            err = journal_commit_sync(pending);
-            ext4_handle_release_buffers(pending);
-            kfree(pending);
+            committed = Ext2CommitPendingJournalHandle(Vcb, journal, pending, &err);
 
             if (err)
                 printk(KERN_ERR "Ext4Fsd: journal commit failed: %d\n", err);
@@ -955,6 +1049,17 @@ Ext2KjournaldThread(PVOID Context)
              * (on failure too -- waiters read JournalCommitError). */
             InterlockedIncrement((LONG *)&Vcb->JournalCommittedSeq);
             KeSetEvent(&Vcb->KjournaldDone, 0, FALSE);
+
+            if (!committed) {
+                LARGE_INTEGER batchDue;
+
+                if (!Vcb->BatchTimerArmed) {
+                    batchDue.QuadPart = (LONGLONG)-10 * 1000 * EXT2_BATCH_DELAY_MS;
+                    KeSetTimer(&Vcb->BatchTimer, batchDue, &Vcb->BatchDpc);
+                    Vcb->BatchTimerArmed = TRUE;
+                }
+                break;
+            }
         }
     }
 
@@ -1076,7 +1181,7 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
 
     /* Fast path: nothing to commit. */
     mutex_lock(&journal->j_checkpoint_mutex);
-    if (!Vcb->PendingJournalHandle) {
+    if (!Vcb->PendingJournalHandle && Vcb->JournalCommitActive == 0) {
         mutex_unlock(&journal->j_checkpoint_mutex);
         return STATUS_SUCCESS;
     }
@@ -1095,29 +1200,36 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     /* Wake kjournald. */
     KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
 
-    /* Wait for committed sequence to advance.  KjournaldDone is an
-     * auto-reset event signaled after each commit; the seq check makes
-     * us resilient to stale signals and concurrent forcers.  6 × 5s =
-     * 30s total, matching the old timeout. */
-    while (Vcb->JournalCommittedSeq == seq && iterations < 6) {
+    /* Drain the FIFO: a successful cycle for an earlier transaction does not
+       make this caller's later transaction durable. */
+    while (iterations < 6) {
         LARGE_INTEGER timeout;
-        timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 5;
-        KeWaitForSingleObject(&Vcb->KjournaldDone, Executive,
-                              KernelMode, FALSE, &timeout);
-        if (Vcb->KjournaldStop)
-            break;
-        iterations++;
+
+        while (Vcb->JournalCommittedSeq == seq && iterations < 6) {
+            timeout.QuadPart = (LONGLONG)-10 * 1000 * 1000 * 5;
+            KeWaitForSingleObject(&Vcb->KjournaldDone, Executive,
+                                  KernelMode, FALSE, &timeout);
+            if (Vcb->KjournaldStop)
+                break;
+            iterations++;
+        }
+
+        if (Vcb->JournalCommittedSeq == seq)
+            return STATUS_IO_TIMEOUT;
+
+        if (Vcb->JournalCommitError)
+            return Ext2WinntError(Vcb->JournalCommitError);
+
+        mutex_lock(&journal->j_checkpoint_mutex);
+        if (!Vcb->PendingJournalHandle && Vcb->JournalCommitActive == 0) {
+            mutex_unlock(&journal->j_checkpoint_mutex);
+            return STATUS_SUCCESS;
+        }
+        mutex_unlock(&journal->j_checkpoint_mutex);
+
+        seq = Vcb->JournalCommittedSeq;
+        KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
     }
 
-    /* No commit cycle completed: kjournald is wedged, dead, or being
-     * stopped.  Reporting success here would tell fsync the metadata
-     * is durable when nothing was committed. */
-    if (Vcb->JournalCommittedSeq == seq)
-        return STATUS_IO_TIMEOUT;
-
-    /* A cycle completed after our snapshot -- surface its result. */
-    if (Vcb->JournalCommitError)
-        return Ext2WinntError(Vcb->JournalCommitError);
-
-    return STATUS_SUCCESS;
+    return STATUS_IO_TIMEOUT;
 }

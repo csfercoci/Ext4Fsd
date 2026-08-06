@@ -109,6 +109,194 @@ Ext2GetInodeTime(
     return SysTime;
 }
 
+static BOOLEAN
+Ext2IsUtf8(struct nls_table *PageTable)
+{
+    return PageTable && !strcmp(PageTable->charset, "utf8");
+}
+
+static ULONG
+Ext2Utf8Decode(IN const UCHAR *Input, IN ULONG InputLength, OUT PULONG CodePoint)
+{
+    ULONG Value;
+    ULONG Length;
+    ULONG Minimum;
+
+    if (InputLength == 0) {
+        return 0;
+    }
+
+    if (Input[0] < 0x80) {
+        *CodePoint = Input[0];
+        return 1;
+    }
+
+    if (Input[0] >= 0xc2 && Input[0] <= 0xdf) {
+        Value = Input[0] & 0x1f;
+        Length = 2;
+        Minimum = 0x80;
+    } else if (Input[0] >= 0xe0 && Input[0] <= 0xef) {
+        Value = Input[0] & 0x0f;
+        Length = 3;
+        Minimum = 0x800;
+    } else if (Input[0] >= 0xf0 && Input[0] <= 0xf4) {
+        Value = Input[0] & 0x07;
+        Length = 4;
+        Minimum = 0x10000;
+    } else {
+        return 0;
+    }
+
+    if (InputLength < Length) {
+        return 0;
+    }
+
+    while (--Length) {
+        Input++;
+        if ((*Input & 0xc0) != 0x80) {
+            return 0;
+        }
+        Value = (Value << 6) | (*Input & 0x3f);
+    }
+
+    if ((Value < Minimum) ||
+        (Value >= 0xd800 && Value <= 0xdfff) ||
+        Value > 0x10ffff) {
+        return 0;
+    }
+
+    *CodePoint = Value;
+    return (Value < 0x800) ? 2 : ((Value < 0x10000) ? 3 : 4);
+}
+
+static ULONG
+Ext2Utf8Encode(IN ULONG CodePoint, OUT PUCHAR Output)
+{
+    if (CodePoint < 0x80) {
+        if (Output) {
+            Output[0] = (UCHAR)CodePoint;
+        }
+        return 1;
+    }
+    if (CodePoint < 0x800) {
+        if (Output) {
+            Output[0] = (UCHAR)(0xc0 | (CodePoint >> 6));
+            Output[1] = (UCHAR)(0x80 | (CodePoint & 0x3f));
+        }
+        return 2;
+    }
+    if (CodePoint < 0x10000) {
+        if (Output) {
+            Output[0] = (UCHAR)(0xe0 | (CodePoint >> 12));
+            Output[1] = (UCHAR)(0x80 | ((CodePoint >> 6) & 0x3f));
+            Output[2] = (UCHAR)(0x80 | (CodePoint & 0x3f));
+        }
+        return 3;
+    }
+    if (CodePoint <= 0x10ffff) {
+        if (Output) {
+            Output[0] = (UCHAR)(0xf0 | (CodePoint >> 18));
+            Output[1] = (UCHAR)(0x80 | ((CodePoint >> 12) & 0x3f));
+            Output[2] = (UCHAR)(0x80 | ((CodePoint >> 6) & 0x3f));
+            Output[3] = (UCHAR)(0x80 | (CodePoint & 0x3f));
+        }
+        return 4;
+    }
+    return 0;
+}
+
+static ULONG
+Ext2Utf8ToUnicode(IN OUT PUNICODE_STRING Unicode, IN PANSI_STRING Mbs)
+{
+    ULONG i = 0;
+    ULONG Length = 0;
+    ULONG CodePoint;
+    ULONG CharLength;
+
+    while (i < Mbs->Length) {
+        CharLength = Ext2Utf8Decode((PUCHAR)Mbs->Buffer + i,
+                                    Mbs->Length - i, &CodePoint);
+        if (CharLength == 0) {
+            return 0;
+        }
+        Length += (CodePoint < 0x10000) ? sizeof(WCHAR) : 2 * sizeof(WCHAR);
+        i += CharLength;
+    }
+
+    if (Unicode) {
+        if (Unicode->MaximumLength < Length) {
+            return 0;
+        }
+        Unicode->Length = 0;
+        i = 0;
+        while (i < Mbs->Length) {
+            CharLength = Ext2Utf8Decode((PUCHAR)Mbs->Buffer + i,
+                                        Mbs->Length - i, &CodePoint);
+            if (CodePoint < 0x10000) {
+                Unicode->Buffer[Unicode->Length / sizeof(WCHAR)] = (WCHAR)CodePoint;
+                Unicode->Length += sizeof(WCHAR);
+            } else {
+                CodePoint -= 0x10000;
+                Unicode->Buffer[Unicode->Length / sizeof(WCHAR)] =
+                    (WCHAR)(0xd800 + (CodePoint >> 10));
+                Unicode->Buffer[Unicode->Length / sizeof(WCHAR) + 1] =
+                    (WCHAR)(0xdc00 + (CodePoint & 0x3ff));
+                Unicode->Length += 2 * sizeof(WCHAR);
+            }
+            i += CharLength;
+        }
+    }
+
+    return Length;
+}
+
+static ULONG
+Ext2UnicodeToUtf8(IN OUT PANSI_STRING Mbs, IN PUNICODE_STRING Unicode)
+{
+    ULONG i = 0;
+    ULONG Length = 0;
+    ULONG CodePoint;
+    ULONG CharLength;
+
+    while (i < Unicode->Length / sizeof(WCHAR)) {
+        CodePoint = Unicode->Buffer[i++];
+        if (CodePoint >= 0xd800 && CodePoint <= 0xdbff) {
+            if (i == Unicode->Length / sizeof(WCHAR) ||
+                Unicode->Buffer[i] < 0xdc00 || Unicode->Buffer[i] > 0xdfff) {
+                return 0;
+            }
+            CodePoint = 0x10000 + ((CodePoint - 0xd800) << 10) +
+                        (Unicode->Buffer[i++] - 0xdc00);
+        } else if (CodePoint >= 0xdc00 && CodePoint <= 0xdfff) {
+            return 0;
+        }
+        CharLength = Ext2Utf8Encode(CodePoint, NULL);
+        if (CharLength == 0) {
+            return 0;
+        }
+        Length += CharLength;
+    }
+
+    if (Mbs) {
+        if (Mbs->MaximumLength < Length) {
+            return 0;
+        }
+        Mbs->Length = 0;
+        i = 0;
+        while (i < Unicode->Length / sizeof(WCHAR)) {
+            CodePoint = Unicode->Buffer[i++];
+            if (CodePoint >= 0xd800 && CodePoint <= 0xdbff) {
+                CodePoint = 0x10000 + ((CodePoint - 0xd800) << 10) +
+                            (Unicode->Buffer[i++] - 0xdc00);
+            }
+            CharLength = Ext2Utf8Encode(CodePoint, (PUCHAR)Mbs->Buffer + Mbs->Length);
+            Mbs->Length += (USHORT)CharLength;
+        }
+    }
+
+    return Length;
+}
+
 ULONG
 Ext2MbsToUnicode(
     struct nls_table *     PageTable,
@@ -118,6 +306,10 @@ Ext2MbsToUnicode(
     ULONG Length = 0;
     int i, mbc = 0;
     WCHAR  uc;
+
+    if (Ext2IsUtf8(PageTable)) {
+        return Ext2Utf8ToUnicode(Unicode, Mbs);
+    }
 
     /* Count the length of the resulting Unicode. */
     for (i = 0; i < Mbs->Length; i += mbc) {
@@ -174,6 +366,10 @@ Ext2UnicodeToMbs (
     ULONG Length = 0;
     UCHAR mbs[0x10];
     int i, mbc;
+
+    if (Ext2IsUtf8(PageTable)) {
+        return Ext2UnicodeToUtf8(Mbs, Unicode);
+    }
 
     /* Count the length of the resulting mbc-8. */
     for (i = 0; i < (Unicode->Length / 2); i++) {
@@ -235,7 +431,7 @@ Ext2OEMToUnicodeSize(
 
     if (Vcb->Codepage.PageTable) {
         Length = Ext2MbsToUnicode(Vcb->Codepage.PageTable, NULL, Oem);
-        if (Length > 0) {
+        if (Length > 0 || Ext2IsUtf8(Vcb->Codepage.PageTable)) {
             goto errorout;
         }
     }
@@ -262,6 +458,10 @@ Ext2OEMToUnicode(
 
         if (Status >0 && Status == Unicode->Length) {
             Status = STATUS_SUCCESS;
+            goto errorout;
+        }
+        if (Ext2IsUtf8(Vcb->Codepage.PageTable)) {
+            Status = STATUS_OBJECT_NAME_INVALID;
             goto errorout;
         }
     }

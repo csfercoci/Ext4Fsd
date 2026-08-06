@@ -64,6 +64,7 @@ Ext2FloppyFlush(IN PVOID Parameter)
     PFILE_OBJECT           FileObject;
     PEXT2_FCB Fcb;
     PEXT2_VCB Vcb;
+    IO_STATUS_BLOCK IoStatus;
 
     Context = (PEXT2_FLPFLUSH_CONTEXT) Parameter;
     FileObject = Context->FileObject;
@@ -80,7 +81,11 @@ Ext2FloppyFlush(IN PVOID Parameter)
         ExAcquireSharedStarveExclusive(&Fcb->PagingIoResource, TRUE);
         ExReleaseResourceLite(&Fcb->PagingIoResource);
 
-        CcFlushCache(&(Fcb->SectionObject), NULL, 0, NULL);
+        RtlZeroMemory(&IoStatus, sizeof(IoStatus));
+        CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
+        if (NT_SUCCESS(IoStatus.Status)) {
+            Ext2ResetOrderedDirtyRanges(Fcb);
+        }
         ExReleaseResourceLite(&Fcb->MainResource);
 
         ObDereferenceObject(FileObject);
@@ -1090,10 +1095,13 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                              * metadata is handed to the pending journal
                              * handle: a concurrent commit can fire between
                              * this stop and the success-path flag set at the
-                             * bottom of __finally, and Ext2FlushDirtyData
+                            * bottom of __finally, and Ext2FlushDirtyData
                              * must see FCB_FILE_MODIFIED to honor data=ordered
                              * for this file. */
                             SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                            Ext2MarkOrderedDirtyRange(Fcb,
+                                                      ByteOffset.QuadPart,
+                                                      ByteOffset.QuadPart + Length);
                             Ext2JournalStop(IrpContext, Vcb);
                             OwnsExpandTxn = FALSE;
                         }
@@ -1204,6 +1212,10 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
                     }
                 }
 
+                Ext2MarkOrderedDirtyRange(Fcb,
+                                          ByteOffset.QuadPart,
+                                          ByteOffset.QuadPart + Length);
+
                 if (ByteOffset.QuadPart + Length > Fcb->Header.ValidDataLength.QuadPart ) {
 
                     if (Fcb->Header.FileSize.QuadPart < ByteOffset.QuadPart + Length) {
@@ -1280,6 +1292,15 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
              * IrpContext, mirroring the read path (Ext2ReadFile).
              */
             if (Status == STATUS_PENDING || Irp == NULL) {
+                if (!PagingIo && !RecursiveWriteThrough && !IsLazyWriter(Fcb)) {
+                    /* Async completion owns the IRP, so record ordered data
+                       before this context is released.  An I/O failure only
+                       causes a conservative later flush. */
+                    Ext2MarkOrderedDirtyRange(Fcb,
+                                              ByteOffset.QuadPart,
+                                              ByteOffset.QuadPart + Length);
+                    SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                }
                 __leave;
             }
 
@@ -1290,6 +1311,10 @@ Ext2WriteFile(IN PEXT2_IRP_CONTEXT IrpContext)
             }
 
             if (NT_SUCCESS(Status) && !RecursiveWriteThrough && !IsLazyWriter(Fcb)) {
+
+                Ext2MarkOrderedDirtyRange(Fcb,
+                                          ByteOffset.QuadPart,
+                                          ByteOffset.QuadPart + Length);
 
                 if (ByteOffset.QuadPart + Length > Fcb->Header.ValidDataLength.QuadPart ) {
 
@@ -1418,6 +1443,7 @@ Ext2WriteComplete (IN PEXT2_IRP_CONTEXT IrpContext)
     PFILE_OBJECT    FileObject;
     PIRP            Irp;
     PIO_STACK_LOCATION IrpSp;
+    PEXT2_FCB       Fcb;
 
     __try {
 
@@ -1432,6 +1458,14 @@ Ext2WriteComplete (IN PEXT2_IRP_CONTEXT IrpContext)
 
         CcMdlWriteComplete(FileObject, &(IrpSp->Parameters.Write.ByteOffset), Irp->MdlAddress);
         Irp->MdlAddress = NULL;
+        Fcb = (PEXT2_FCB)FileObject->FsContext;
+        if (Fcb && Fcb->Identifier.Type == EXT2FCB) {
+            Ext2MarkOrderedDirtyRange(Fcb,
+                                      IrpSp->Parameters.Write.ByteOffset.QuadPart,
+                                      IrpSp->Parameters.Write.ByteOffset.QuadPart +
+                                      IrpSp->Parameters.Write.Length);
+            SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        }
         Status = STATUS_SUCCESS;
 
     } __finally {

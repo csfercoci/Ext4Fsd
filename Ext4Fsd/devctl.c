@@ -516,9 +516,17 @@ Ext2ProcessVolumeProperty(
                 }
             }
 
-            PageTable = load_nls(Property->Codepage);
-            memcpy(Vcb->Codepage.AnsiName, Property->Codepage, CODEPAGE_MAXLEN);
-            Vcb->Codepage.PageTable = PageTable;
+            if (Property->Codepage[0]) {
+                PageTable = load_nls(Property->Codepage);
+                memcpy(Vcb->Codepage.AnsiName, Property->Codepage,
+                       CODEPAGE_MAXLEN);
+                Vcb->Codepage.PageTable = PageTable;
+            } else {
+                /* Volume settings without CodePage inherit the UTF-8 global default. */
+                memcpy(Vcb->Codepage.AnsiName, Ext2Global->Codepage.AnsiName,
+                       CODEPAGE_MAXLEN);
+                Vcb->Codepage.PageTable = Ext2Global->Codepage.PageTable;
+            }
             if (Vcb->Codepage.PageTable) {
                 Ext2InitializeLabel(Vcb, Vcb->SuperBlock);
             }

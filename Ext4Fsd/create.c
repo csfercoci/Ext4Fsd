@@ -851,6 +851,7 @@ Ext2CreateFile(
 
     UNICODE_STRING      FileName;
     PIRP                Irp;
+    IO_STATUS_BLOCK     FlushStatus;
 
     ULONG               Options;
     ULONG               CreateDisposition;
@@ -1544,8 +1545,12 @@ Openit:
                             if (Fcb->NonCachedOpenCount == Fcb->OpenHandleCount) {
 
                                 if (!IsVcbReadOnly(Vcb)) {
-                                    CcFlushCache(&Fcb->SectionObject, NULL, 0, NULL);
-                                    ClearLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                                    RtlZeroMemory(&FlushStatus, sizeof(FlushStatus));
+                                    CcFlushCache(&Fcb->SectionObject, NULL, 0, &FlushStatus);
+                                    if (NT_SUCCESS(FlushStatus.Status)) {
+                                        Ext2ResetOrderedDirtyRanges(Fcb);
+                                        ClearLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                                    }
                                 }
 
                                 CcPurgeCacheSection(&Fcb->SectionObject,

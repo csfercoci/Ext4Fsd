@@ -1352,6 +1352,8 @@ Ext2SetRenameInfo(
     PEXT2_MCB               ExistingMcb = NULL;
 
     UNICODE_STRING          FileName;
+    UNICODE_STRING          NewShortName = {0};
+    UNICODE_STRING          NewFullName = {0};
 
     NTSTATUS                Status;
 
@@ -1502,6 +1504,13 @@ Ext2SetRenameInfo(
                  0
              );
 
+    /* Allocate replacement names before deleting a replacement target. */
+    if (!Ext2BuildName(&NewShortName, &FileName, NULL) ||
+        !Ext2BuildName(&NewFullName, &FileName, &TargetMcb->FullName)) {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto errorout;
+    }
+
     if (NT_SUCCESS(Status) && ExistingMcb != Mcb) {
 
         if (!ReplaceIfExists) {
@@ -1610,23 +1619,32 @@ Ext2SetRenameInfo(
 
         }
 
-        if (TargetMcb->Inode.i_ino != ParentMcb->Inode.i_ino) {
-            Ext2RemoveMcb(Vcb, Mcb);
-            Ext2InsertMcb(Vcb, TargetMcb, Mcb);
+        /*
+         * The parent keeps a name-keyed hash of its children, so the Mcb's
+         * position in that hash depends on its current ShortName.  Unlink the
+         * Mcb while it still owns its old names, swap in the already allocated
+         * names, then re-insert it under the target parent.  Preallocation is
+         * essential: a failed allocation here must not orphan the live MCB.
+         */
+        Ext2RemoveMcb(Vcb, Mcb);
+
+        if (Mcb->ShortName.Buffer) {
+            DEC_MEM_COUNT(PS_MCB_NAME, Mcb->ShortName.Buffer,
+                          Mcb->ShortName.MaximumLength);
+            Ext2FreePool(Mcb->ShortName.Buffer, EXT2_FNAME_MAGIC);
+        }
+        if (Mcb->FullName.Buffer) {
+            DEC_MEM_COUNT(PS_MCB_NAME, Mcb->FullName.Buffer,
+                          Mcb->FullName.MaximumLength);
+            Ext2FreePool(Mcb->FullName.Buffer, EXT2_FNAME_MAGIC);
         }
 
-        if (!Ext2BuildName( &Mcb->ShortName,
-                            &FileName, NULL     )) {
-            Status = STATUS_INSUFFICIENT_RESOURCES;
-            goto errorout;
-        }
+        Mcb->ShortName = NewShortName;
+        Mcb->FullName = NewFullName;
+        RtlZeroMemory(&NewShortName, sizeof(NewShortName));
+        RtlZeroMemory(&NewFullName, sizeof(NewFullName));
 
-        if (!Ext2BuildName( &Mcb->FullName,
-                            &FileName,
-                            &TargetMcb->FullName)) {
-            Status = STATUS_INSUFFICIENT_RESOURCES;
-            goto errorout;
-        }
+        Ext2InsertMcb(Vcb, TargetMcb, Mcb);
 
         if (bMove) {
             Ext2NotifyReportChange(
@@ -1650,6 +1668,18 @@ Ext2SetRenameInfo(
     }
 
 errorout:
+
+    if (NewShortName.Buffer) {
+        DEC_MEM_COUNT(PS_MCB_NAME, NewShortName.Buffer,
+                      NewShortName.MaximumLength);
+        Ext2FreePool(NewShortName.Buffer, EXT2_FNAME_MAGIC);
+    }
+
+    if (NewFullName.Buffer) {
+        DEC_MEM_COUNT(PS_MCB_NAME, NewFullName.Buffer,
+                      NewFullName.MaximumLength);
+        Ext2FreePool(NewFullName.Buffer, EXT2_FNAME_MAGIC);
+    }
 
     if (bFcbLockAcquired) {
         ExReleaseResourceLite(&Vcb->FcbLock);
