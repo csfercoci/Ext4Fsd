@@ -990,10 +990,6 @@ Ext2SaveInode ( IN PEXT2_IRP_CONTEXT IrpContext,
     LONGLONG                offset;
     BOOLEAN                 rc = 0;
 
-    if (Inode) {
-        Ext2InvalidateInodeCache(Vcb, Inode->i_ino);
-    }
-
     DEBUG(DL_INF, ( "Ext2SaveInode: Saving Inode %xh: Mode=%xh Size=%xh\n",
                     Inode->i_ino, Inode->i_mode, Inode->i_size));
     rc = Ext2GetInodeLba(Vcb,  Inode->i_ino, &offset);
@@ -1009,6 +1005,10 @@ Ext2SaveInode ( IN PEXT2_IRP_CONTEXT IrpContext,
     }
 
     ExAcquireResourceExclusiveLite(&Vcb->sbi.s_gd_lock, TRUE);
+
+    if (Inode) {
+        Ext2InvalidateInodeCache(Vcb, Inode->i_ino);
+    }
 
     rc = Ext2LoadBuffer(NULL, Vcb, offset, EXT4_INODE_SIZE(Inode->i_sb), ext4i);
     if (!rc) {
