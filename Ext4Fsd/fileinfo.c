@@ -768,16 +768,15 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
 
                     if (NT_SUCCESS(Status)) {
                         ClearLongFlag(Fcb->Flags, FCB_ALLOC_IN_CREATE);
-                    }
-
-                    NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
-                    Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
-                    if (Mcb->Inode.i_size > (loff_t)AllocationSize.QuadPart) {
-                        Mcb->Inode.i_size = AllocationSize.QuadPart;
-                    }
-                    Fcb->Header.FileSize.QuadPart = Mcb->Inode.i_size;
-                    if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
-                        Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
+                        NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
+                        Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
+                        if (Mcb->Inode.i_size > (loff_t)AllocationSize.QuadPart) {
+                            Mcb->Inode.i_size = AllocationSize.QuadPart;
+                        }
+                        Fcb->Header.FileSize.QuadPart = Mcb->Inode.i_size;
+                        if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
+                            Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
+                        }
                     }
 
                 } else {
@@ -788,7 +787,7 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                 }
             }
 
-            if (NotifyFilter) {
+            if (NotifyFilter && NT_SUCCESS(Status)) {
 
                 SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
                 SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
@@ -888,27 +887,25 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                     /* truncate file blocks */
                     Status = Ext2TruncateFile(IrpContext, Vcb, Mcb, &NewSize);
 
-                    /* restore original file size */
                     if (NT_SUCCESS(Status)) {
                         ClearLongFlag(Fcb->Flags, FCB_ALLOC_IN_CREATE);
-                    }
 
-                    /* update file allocateion size */
-                    Fcb->Header.AllocationSize.QuadPart = NewSize.QuadPart;
+                        /* update file allocation size only after successful free */
+                        Fcb->Header.AllocationSize.QuadPart = NewSize.QuadPart;
 
-                    ASSERT((loff_t)NewSize.QuadPart >= Mcb->Inode.i_size);
-                    if ((loff_t)Fcb->Header.FileSize.QuadPart < Mcb->Inode.i_size) {
-                        Fcb->Header.FileSize.QuadPart = Mcb->Inode.i_size;
-                    }
-                    if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
-                        Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
-                    }
+                        ASSERT((loff_t)NewSize.QuadPart >= Mcb->Inode.i_size);
+                        if ((loff_t)Fcb->Header.FileSize.QuadPart < Mcb->Inode.i_size) {
+                            Fcb->Header.FileSize.QuadPart = Mcb->Inode.i_size;
+                        }
+                        if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
+                            Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
+                        }
 
-                    SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
-                    SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                        SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
+                        SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+                        NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
+                    }
                 }
-
-                NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
             }
 
             if (NT_SUCCESS(Status)) {
@@ -1215,8 +1212,25 @@ Ext2TruncateFile(
 {
     NTSTATUS status = STATUS_SUCCESS;
     BOOLEAN  OwnsTxn = FALSE;
+    BOOLEAN  TruncateOrphan = FALSE;
 
     OwnsTxn = Ext2JournalNestedStart(IrpContext, Vcb, 32);
+
+    /*
+     * Truncate-orphan (nlink>0): Linux order — persist the new i_size, then
+     * link onto s_last_orphan, then free blocks.  A crash mid-free leaves
+     * i_size already at the target so mount replay truncates to i_size and
+     * reclaims the leftover blocks.  Delete path already set nlink==0 and
+     * called OrphanAdd — skip here.
+     */
+    if (Mcb->Inode.i_nlink > 0 &&
+        EXT4_SB(&Vcb->sb)->s_journal != NULL &&
+        (loff_t)Size->QuadPart < Mcb->Inode.i_size) {
+        Mcb->Inode.i_size = (loff_t)Size->QuadPart;
+        Ext2SaveInode(IrpContext, Vcb, &Mcb->Inode);
+        Ext2OrphanAdd(IrpContext, Vcb, &Mcb->Inode);
+        TruncateOrphan = TRUE;
+    }
 
     if (INODE_HAS_EXTENT(&Mcb->Inode)) {
 		status = Ext2TruncateExtent(IrpContext, Vcb, Mcb, Size);
@@ -1225,7 +1239,7 @@ Ext2TruncateFile(
 	}
 
     /* check and clear data/meta mcb extents */
-    if (Size->QuadPart == 0) {
+    if (NT_SUCCESS(status) && Size->QuadPart == 0) {
 
         /* check and remove all data extents */
         if (Ext2ListExtents(&Mcb->Extents)) {
@@ -1238,6 +1252,14 @@ Ext2TruncateFile(
         }
         Ext2ClearAllExtents(&Mcb->MetaExts);
         ClearLongFlag(Mcb->Flags, MCB_ZONE_INITED);
+    }
+
+    if (TruncateOrphan) {
+        if (NT_SUCCESS(status)) {
+            Ext2OrphanDel(IrpContext, Vcb, &Mcb->Inode);
+            Ext2SaveInode(IrpContext, Vcb, &Mcb->Inode);
+        }
+        /* on failure leave on orphan list for mount replay */
     }
 
     if (OwnsTxn) {
@@ -2096,21 +2118,34 @@ Ext2DeleteFile(
                 /* check file offset mappings */
                 DEBUG(DL_EXT, ("Ext2DeleteFile ...: %wZ\n", &Mcb->FullName));
 
-                if (Fcb) {
-                    Fcb->Header.AllocationSize.QuadPart = Size.QuadPart;
-                    if (Fcb->Header.FileSize.QuadPart > Size.QuadPart) {
-                        Fcb->Header.FileSize.QuadPart = Size.QuadPart;
-                        Fcb->Mcb->Inode.i_size = Size.QuadPart;
-                    }
-                    if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
-                        Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
-                    }
-                } else if (Mcb) {
-                    /* Update the inode's data length . It should be ZERO if succeeds. */
-                    if (Mcb->Inode.i_size > (loff_t)Size.QuadPart) {
-                        Mcb->Inode.i_size = Size.QuadPart;
+                if (NT_SUCCESS(Status)) {
+                    if (Fcb) {
+                        Fcb->Header.AllocationSize.QuadPart = Size.QuadPart;
+                        if (Fcb->Header.FileSize.QuadPart > Size.QuadPart) {
+                            Fcb->Header.FileSize.QuadPart = Size.QuadPart;
+                            Fcb->Mcb->Inode.i_size = Size.QuadPart;
+                        }
+                        if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
+                            Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
+                        }
+                    } else if (Mcb) {
+                        /* Update the inode's data length . It should be ZERO if succeeds. */
+                        if (Mcb->Inode.i_size > (loff_t)Size.QuadPart) {
+                            Mcb->Inode.i_size = Size.QuadPart;
+                        }
                     }
                 }
+            }
+
+            /*
+             * Only free the inode after truncate fully succeeds.  On failure
+             * leave nlink==0 on the orphan list so mount replay finishes the
+             * delete; FreeInode here would leak blocks and drop recovery.
+             */
+            if (!NT_SUCCESS(Status)) {
+                DEBUG(DL_ERR, ("Ext2DeleteFile: truncate failed %xh, orphan kept ino=%xh\n",
+                               Status, Mcb->Inode.i_ino));
+                __leave;
             }
 
             /* set delete time and free the inode */

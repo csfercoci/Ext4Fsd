@@ -27,19 +27,28 @@ extern PEXT2_GLOBAL Ext2Global;
  * buffer with that handle so it is written via the journal on commit.
  * Otherwise fall back to the legacy direct mark_buffer_dirty path.
  *
+ * Returns NTSTATUS: STATUS_SUCCESS, or STATUS_INSUFFICIENT_RESOURCES when
+ * the handle buffer list is full (caller must stop mutating metadata).
+ *
  * The buffer is logically owned by the caller; the helper does not change
  * its refcount or release it.
  */
-static inline void
+static inline NTSTATUS
 Ext2DirtyMetadata(PEXT2_IRP_CONTEXT IrpContext, PEXT2_VCB Vcb,
                   struct buffer_head *bh)
 {
+    int err;
+
     if (IrpContext && IrpContext->Handle) {
-        ext4_handle_dirty_metadata((handle_t *)IrpContext->Handle,
-                                   IrpContext, NULL, bh);
-    } else {
-        mark_buffer_dirty(bh);
+        err = ext4_handle_dirty_metadata((handle_t *)IrpContext->Handle,
+                                         IrpContext, NULL, bh);
+        if (err)
+            return Ext2WinntError(err);
+        return STATUS_SUCCESS;
     }
+
+    mark_buffer_dirty(bh);
+    return STATUS_SUCCESS;
 }
 
 /* FUNCTIONS ***************************************************************/
@@ -425,7 +434,10 @@ Ext2SaveGroup(
         return 0;
 
     ext4_group_desc_csum_set(&Vcb->sb, Group, gd);
-    Ext2DirtyMetadata(IrpContext, Vcb, gb);
+    if (!NT_SUCCESS(Ext2DirtyMetadata(IrpContext, Vcb, gb))) {
+        fini_bh(&gb);
+        return FALSE;
+    }
     fini_bh(&gb);
 
     return TRUE;
@@ -1171,8 +1183,8 @@ Ext2SaveBlock ( IN PEXT2_IRP_CONTEXT    IrpContext,
         }
 
         RtlCopyMemory(bh->b_data, Buf, BLOCK_SIZE);
-        Ext2DirtyMetadata(IrpContext, Vcb, bh);
-        rc = TRUE;
+        if (NT_SUCCESS(Ext2DirtyMetadata(IrpContext, Vcb, bh)))
+            rc = TRUE;
 
     } __finally {
 
@@ -1293,7 +1305,8 @@ Ext2ZeroBuffer( IN PEXT2_IRP_CONTEXT    IrpContext,
                 } else {
                     RtlZeroMemory(bh->b_data + delta, len);
                 }
-                Ext2DirtyMetadata(IrpContext, Vcb, bh);
+                if (!NT_SUCCESS(Ext2DirtyMetadata(IrpContext, Vcb, bh)))
+                    __leave;
             } __finally {
                 fini_bh(&bh);
             }
@@ -1359,7 +1372,8 @@ Ext2SaveBuffer( IN PEXT2_IRP_CONTEXT    IrpContext,
 
             __try {
                 RtlCopyMemory(bh->b_data + delta, buf, len);
-                Ext2DirtyMetadata(IrpContext, Vcb, bh);
+                if (!NT_SUCCESS(Ext2DirtyMetadata(IrpContext, Vcb, bh)))
+                    __leave;
             } __finally {
                 fini_bh(&bh);
             }
@@ -1573,8 +1587,10 @@ Again:
         /* mark block bits as allocated */
         RtlSetBits(&BlockBitmap, Index, *Number);
 
-        /* set block bitmap dirty in cache */
-        mark_buffer_dirty(bh);
+        /* journal block bitmap with the same handle as GD/SB */
+        Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
+        if (!NT_SUCCESS(Status))
+            goto errorout;
 
         /* update group description */
         {
@@ -1641,14 +1657,10 @@ Ext2FreeBlock(
     struct super_block     *sb = &Vcb->sb;
     PEXT2_GROUP_DESC        gd;
     struct buffer_head     *gb = NULL;
-    struct buffer_head      bh;
+    struct buffer_head     *bh = NULL;
     ext4_fsblk_t            bitmap_blk;
 
     RTL_BITMAP      BlockBitmap;
-    LARGE_INTEGER   Offset;
-
-    PBCB            BitmapBcb;
-    PVOID           BitmapCache;
 
     ULONG           Group;
     ULONG           Index;
@@ -1666,6 +1678,11 @@ Ext2FreeBlock(
     Index = (Block - EXT2_FIRST_DATA_BLOCK) % BLOCKS_PER_GROUP;
 
 Again:
+
+    if (bh) {
+        fini_bh(&bh);
+        bh = NULL;
+    }
 
     if (gb)
         fini_bh(&gb);
@@ -1694,10 +1711,6 @@ Again:
             goto errorout;
         }
 
-        /* get bitmap block offset and length */
-        Offset.QuadPart = bitmap_blk;
-        Offset.QuadPart = Offset.QuadPart << BLOCK_BITS;
-
         if (Group == Vcb->sbi.s_groups_count - 1) {
 
             Length = (ULONG)(TOTAL_BLOCKS % BLOCKS_PER_GROUP);
@@ -1711,23 +1724,25 @@ Again:
             Length = BLOCKS_PER_GROUP;
         }
 
-        /* read and initialize bitmap */
-        if (!CcPinRead( Vcb->Volume,
-                        &Offset,
-                        Vcb->BlockSize,
-                        PIN_WAIT,
-                        &BitmapBcb,
-                        &BitmapCache ) ) {
-
-            DEBUG(DL_ERR, ("Ext2FreeBlock: failed to PinLock bitmap block %xh.\n",
+        /* load block bitmap through buffer_head so it can be journaled */
+        bh = sb_getblk(sb, bitmap_blk);
+        if (!bh) {
+            DEBUG(DL_ERR, ("Ext2FreeBlock: failed to get bitmap block %xh.\n",
                            bitmap_blk));
-            Status = STATUS_CANT_WAIT;
+            Status = STATUS_INSUFFICIENT_RESOURCES;
             DbgBreak();
             goto errorout;
         }
+        if (!buffer_uptodate(bh)) {
+            int err = bh_submit_read(bh);
+            if (err < 0) {
+                Status = Ext2WinntError(err);
+                goto errorout;
+            }
+        }
 
-        /* clear usused bits */
-        RtlInitializeBitMap(&BlockBitmap, BitmapCache, Length);
+        /* clear unused bits */
+        RtlInitializeBitMap(&BlockBitmap, (PULONG)bh->b_data, Length);
         Count = min(Length - Index, Number);
         RtlClearBits(&BlockBitmap, Index, Count);
 
@@ -1741,15 +1756,12 @@ Again:
             Ext2SaveSuper(IrpContext, Vcb);
         }
 
-        bh.b_data = BitmapCache;
-        ext4_block_bitmap_csum_set(sb, Group, gd, &bh);
+        ext4_block_bitmap_csum_set(sb, Group, gd, bh);
 
-        /* indict the cache range is dirty */
-        CcSetDirtyPinnedData(BitmapBcb, NULL );
-        Ext2AddVcbExtent(Vcb, Offset.QuadPart, (LONGLONG)Vcb->BlockSize);
-        CcUnpinData(BitmapBcb);
-        BitmapBcb = NULL;
-        BitmapCache = NULL;
+        Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
+        if (!NT_SUCCESS(Status))
+            goto errorout;
+
         Ext2SaveGroup(IrpContext, Vcb, Group);
 
         /* record revoke for each freed block so log replay does not
@@ -1786,6 +1798,9 @@ Again:
     Status = STATUS_SUCCESS;
 
 errorout:
+
+    if (bh)
+        fini_bh(&bh);
 
     if (gb)
         fini_bh(&gb);
@@ -2080,8 +2095,10 @@ repeat:
 
         RtlSetBits(&InodeBitmap, dwInode, 1);
 
-        /* set block bitmap dirty in cache */
-        mark_buffer_dirty(bh);
+        /* journal inode bitmap with the same handle as GD/SB */
+        Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
+        if (!NT_SUCCESS(Status))
+            goto errorout;
 
         /* If we didn't allocate from within the initialized part of the inode
          * table then we need to initialize up to this inode. */
@@ -2293,8 +2310,10 @@ Ext2FreeInode(
         ext4_free_inodes_set(sb, gd,
                              RtlNumberOfClearBits(&InodeBitmap));
 
-        /* set inode block dirty and add to vcb dirty range */
-        mark_buffer_dirty(bh);
+        /* journal inode bitmap with the same handle as GD/SB */
+        Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
+        if (!NT_SUCCESS(Status))
+            goto errorout;
 
         /* update group_desc and super_block */
         if (Type == EXT2_FT_DIR) {
@@ -2440,7 +2459,8 @@ Ext2SetFileType (
             __leave;
 
         ext3_set_de_type(inode->i_sb, de, mode);
-        mark_buffer_dirty(bh);
+        if (!NT_SUCCESS(Ext2DirtyMetadata(IrpContext, Vcb, bh)))
+            __leave;
 
         if (S_ISDIR(inode->i_mode) == S_ISDIR(mode)) {
         } else if (S_ISDIR(inode->i_mode)) {

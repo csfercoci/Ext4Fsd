@@ -22,6 +22,10 @@ static inline int ext4_handle_valid(handle_t *handle)
  * durability within this window is still provided by fsync/FlushFileBuffers
  * (Ext2JournalForceCommit) and the flush/dismount funnel. */
 #define EXT2_BATCH_DELAY_MS           5000
+/* Linux jbd2 max_batch_time default (~15ms): on fsync, wait briefly so
+ * concurrent FlushFileBuffers/fsync callers join one commit cycle instead
+ * of serializing N full journal commits under Explorer copy. */
+#define EXT2_FSYNC_BATCH_MS           15
 
 struct ext4_handle {
     handle_t            h;
@@ -93,11 +97,15 @@ static int journal_wait_for_writes(struct buffer_head **bufs, int nbufs)
  */
 static int journal_commit_sync(struct ext4_handle *eh)
 {
-    journal_t                  *journal = eh->journal;
-    PEXT2_VCB                  Vcb = (PEXT2_VCB)eh->sb->s_bdev->bd_priv;
-    int                        blocksize = journal->j_blocksize;
+    journal_t                 *journal = eh->journal;
+    PEXT2_VCB                  Vcb = eh->sb->s_bdev->bd_priv;
+    int                        blocksize = eh->sb->s_blocksize;
     unsigned long              head, first, last;
     unsigned long              transaction_start;
+    unsigned long              saved_head = 0;
+    unsigned long              saved_free = 0;
+    tid_t                      saved_tid = 0;
+    BOOLEAN                    advanced = FALSE;
     int                        i, err = 0;
     unsigned long long         desc_phys, commit_phys;
     unsigned long long         data_phys[MAX_HANDLE_BUFFERS];
@@ -398,9 +406,13 @@ static int journal_commit_sync(struct ext4_handle *eh)
 
     /* --- Phase 5: Update journal head in memory --- */
 
+    saved_head = journal->j_head;
+    saved_free = journal->j_free;
+    saved_tid = journal->j_transaction_sequence;
     journal->j_head = head;
     journal->j_free -= nblocks;
     journal->j_transaction_sequence++;
+    advanced = TRUE;
 
     /* --- Phase 6: Write originals to home locations --- */
 
@@ -431,6 +443,7 @@ static int journal_commit_sync(struct ext4_handle *eh)
         journal->j_tail = journal->j_head;
         journal->j_tail_sequence = journal->j_transaction_sequence;
         journal->j_flags |= JBD2_FLUSHED;
+        advanced = FALSE; /* reclaim done; no rollback needed */
     }
 
     goto out_release;
@@ -440,6 +453,18 @@ out_wait_journal:
         journal_wait_for_writes(wbufs, nwbufs);
 
 out_release:
+    /*
+     * On failure after j_head/j_free advanced but before reclaim, restore
+     * in-memory journal space so later commits are not permanently ENOSPC.
+     * On-disk journal may still hold a partial txn; recovery is safe because
+     * we never advanced the durable tail past unwritten homes on error paths
+     * that skip the successful reclaim block above.
+     */
+    if (err && advanced) {
+        journal->j_head = saved_head;
+        journal->j_free = saved_free;
+        journal->j_transaction_sequence = saved_tid;
+    }
     mutex_unlock(&journal->j_checkpoint_mutex);
     return err;
 }
@@ -929,6 +954,18 @@ Ext2CommitPendingJournalHandle(
     }
 
     *err = journal_commit_sync(pending);
+    if (*err) {
+        /*
+         * Keep the handle (and its pinned bh refs) on the pending FIFO so
+         * a later force-commit / kjournald cycle can retry.  Dropping it
+         * would leave dirty metadata without an atomic journal commit and
+         * permanently lose the only recovery record for this txn.
+         */
+        Ext2RequeueJournalHandleFront(Vcb, journal, pending);
+        Ext2FinishPendingJournalHandle(Vcb, journal);
+        return FALSE;
+    }
+
     ext4_handle_release_buffers(pending);
     kfree(pending);
     Ext2FinishPendingJournalHandle(Vcb, journal);
@@ -1171,6 +1208,7 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     journal_t *journal;
     ULONG seq;
     int iterations = 0;
+    LARGE_INTEGER batchWait;
 
     if (!Vcb)
         return STATUS_SUCCESS;
@@ -1187,13 +1225,30 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     }
     mutex_unlock(&journal->j_checkpoint_mutex);
 
+    /*
+     * fsync batching (Linux jbd2 max_batch_time): give concurrent fsync /
+     * FlushFileBuffers callers a short window to attach more dirty metadata
+     * to the same pending handle before we cancel the long batch timer and
+     * force kjournald.  One commit then covers N files (Explorer copy).
+     */
+    batchWait.QuadPart = (LONGLONG)-10 * 1000 * EXT2_FSYNC_BATCH_MS;
+    KeDelayExecutionThread(KernelMode, FALSE, &batchWait);
+
+    /* Re-check after the batch window — another forcer may have drained. */
+    mutex_lock(&journal->j_checkpoint_mutex);
+    if (!Vcb->PendingJournalHandle && Vcb->JournalCommitActive == 0) {
+        mutex_unlock(&journal->j_checkpoint_mutex);
+        return STATUS_SUCCESS;
+    }
+    mutex_unlock(&journal->j_checkpoint_mutex);
+
     /* Snapshot the current committed sequence — we'll wait until it
      * advances past this value, which means at least one commit happened
      * after our snapshot (and therefore after any metadata our caller
      * contributed to the pending handle). */
     seq = Vcb->JournalCommittedSeq;
 
-    /* Cancel batch timer — we want an immediate commit. */
+    /* Cancel long batch timer — we want an immediate commit now. */
     KeCancelTimer(&Vcb->BatchTimer);
     Vcb->BatchTimerArmed = FALSE;
 

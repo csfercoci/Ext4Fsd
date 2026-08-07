@@ -27,7 +27,15 @@ cmd /c "call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary
 
 ## Detailed docs (read the relevant one before working)
 
-- `agent_docs/architecture.md` — source tree map, module roles, JBD2/journaling model
+- `agent_docs/architecture.md` — source tree, codepage/UTF-8, caches, JBD2 overview
 - `agent_docs/conventions.md` — code style, endianness/type gotchas, tooling noise to ignore
-- `docs/journaling.md` — kjournald, commit barriers, buffer pinning, orphan list
+- `docs/journaling.md` — kjournald batch/force-commit, barriers, dirty ranges, orphans, stubs
 - `docs/testing.md` — VM test harness and workflows
+
+## Notable recent behavior (committed)
+
+- Default CodePage **utf8** when registry unset/invalid; volume inherits global; surrogate-aware UTF-8 codec
+- Inode cache, MCB child hash, per-FCB ordered dirty ranges, rename preallocate-before-delete
+- Journal: real commit ordering + disk flush barriers, `JournalCommittedSeq` fsync wait, error propagation
+- Orphan on truncate fail / truncate-orphan nlink>0; bitmaps journaled; failed commit requeues handle
+- Perf: 15ms fsync batch, bulk flush one commit, ranged CcFlush; dir enum reads whole blocks

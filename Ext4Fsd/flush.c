@@ -33,30 +33,21 @@ Ext2FlushCompletionRoutine (
     return STATUS_SUCCESS;
 }
 
-NTSTATUS
-Ext2FlushVolume (
-    IN PEXT2_IRP_CONTEXT    IrpContext,
-    IN PEXT2_VCB            Vcb,
-    IN BOOLEAN              bShutDown
-)
-{
-    DEBUG(DL_INF, ( "Ext2FlushVolume: Flushing Vcb ...\n"));
-
-    ExAcquireSharedStarveExclusive(&Vcb->PagingIoResource, TRUE);
-    ExReleaseResourceLite(&Vcb->PagingIoResource);
-
-    return Ext2FlushVcb(Vcb);
-}
-
-NTSTATUS
-Ext2FlushFile (
+/*
+ * Flush file data + optional mtime update.  When CommitJournal is FALSE the
+ * caller will force one journal commit after flushing many files (bulk path).
+ */
+static NTSTATUS
+Ext2FlushFileInternal (
     IN PEXT2_IRP_CONTEXT    IrpContext,
     IN PEXT2_FCB            Fcb,
-    IN PEXT2_CCB            Ccb
+    IN PEXT2_CCB            Ccb,
+    IN BOOLEAN              CommitJournal
 )
 {
     IO_STATUS_BLOCK     IoStatus = {0};
     NTSTATUS            Status;
+    BOOLEAN             MetadataDirty = FALSE;
 
     ASSERT(Fcb != NULL);
     ASSERT((Fcb->Identifier.Type == EXT2FCB) &&
@@ -81,53 +72,102 @@ Ext2FlushFile (
                 Ext2SetInodeTime(&SysTime, &Fcb->Inode->i_mtime, &Fcb->Inode->i_mtime_extra);
                 Fcb->Mcb->LastWriteTime = Ext2GetInodeTime(Fcb->Inode->i_mtime, Fcb->Inode->i_mtime_extra);
                 Ext2SaveInode(IrpContext, Fcb->Vcb, Fcb->Inode);
+                MetadataDirty = TRUE;
             }
         }
 
         if (IsDirectory(Fcb)) {
             IoStatus.Status = STATUS_SUCCESS;
+            /* Directory metadata (mtime) may still need a journal commit. */
+            if (CommitJournal && MetadataDirty) {
+                Status = Ext2JournalForceCommit(Fcb->Vcb);
+                if (!NT_SUCCESS(Status)) {
+                    IoStatus.Status = Status;
+                }
+            }
             __leave;
         }
 
         DEBUG(DL_INF, ( "Ext2FlushFile: Flushing File Inode=%xh %S ...\n",
                         Fcb->Inode->i_ino, Fcb->Mcb->ShortName.Buffer));
 
-        CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
-        if (!NT_SUCCESS(IoStatus.Status)) {
-            __leave;
+        /*
+         * Prefer ordered dirty ranges (data=ordered) over full-file flush.
+         * Explorer copy + multi-flush then only rewrites recently dirtied
+         * windows instead of the entire growing target file each time.
+         */
+        {
+            EXT2_ORDERED_DIRTY_RANGE Ranges[EXT2_ORDERED_DIRTY_RANGE_COUNT];
+            KIRQL Irql;
+            ULONG Count;
+            ULONG i;
+
+            KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
+            Count = Fcb->OrderedDirtyRangeCount;
+            if (Count > 0) {
+                RtlCopyMemory(Ranges, Fcb->OrderedDirtyRanges,
+                              Count * sizeof(EXT2_ORDERED_DIRTY_RANGE));
+                Fcb->OrderedDirtyRangeCount = 0;
+            }
+            KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
+
+            if (Count > 0) {
+                IoStatus.Status = STATUS_SUCCESS;
+                for (i = 0; i < Count; i++) {
+                    LONGLONG Pos = Ranges[i].Start;
+
+                    while (Pos < Ranges[i].End) {
+                        IO_STATUS_BLOCK RangeStatus = {0};
+                        LARGE_INTEGER Offset;
+                        ULONG Length;
+                        LONGLONG Remaining = Ranges[i].End - Pos;
+
+                        Length = (Remaining > (LONGLONG)(256 * 1024 * 1024)) ?
+                                 (256 * 1024 * 1024) : (ULONG)Remaining;
+                        Offset.QuadPart = Pos;
+                        CcFlushCache(&Fcb->SectionObject, &Offset, Length, &RangeStatus);
+                        if (!NT_SUCCESS(RangeStatus.Status)) {
+                            ULONG j;
+                            for (j = 0; j < Count; j++) {
+                                Ext2MarkOrderedDirtyRange(Fcb, Ranges[j].Start, Ranges[j].End);
+                            }
+                            IoStatus = RangeStatus;
+                            __leave;
+                        }
+                        Pos += Length;
+                    }
+                }
+            } else {
+                CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
+                if (!NT_SUCCESS(IoStatus.Status)) {
+                    __leave;
+                }
+            }
         }
+
         Ext2ResetOrderedDirtyRanges(Fcb);
         ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
 
         if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
             Ext2SaveInode(IrpContext, Fcb->Vcb, Fcb->Inode);
             ClearFlag(Fcb->Flags, FCB_ALLOC_IN_WRITE);
+            MetadataDirty = TRUE;
         }
 
         /*
-         * Force-commit the pending journal handle so that the metadata
-         * we just saved (inode, extent tree, etc.) reaches disk before
-         * the caller's fsync / FlushFileBuffers returns.  Without this,
-         * the deferred commit by kjournald (10s interval) would leave a
-         * window where a crash loses the just-written metadata.
-         * A failed/timed-out commit must fail the fsync: the caller's
-         * durability contract was not met.
+         * Force-commit only when this flush dirtied metadata or the caller
+         * asked for a per-file durability barrier.  Bulk Ext2FlushFiles sets
+         * CommitJournal=FALSE and issues one Ext2JournalForceCommit after
+         * all files, matching Linux "one commit for N fsyncs".
          */
-        Status = Ext2JournalForceCommit(Fcb->Vcb);
-        if (!NT_SUCCESS(Status)) {
-            IoStatus.Status = Status;
+        if (CommitJournal) {
+            Status = Ext2JournalForceCommit(Fcb->Vcb);
+            if (!NT_SUCCESS(Status)) {
+                IoStatus.Status = Status;
+            }
+        } else {
+            UNREFERENCED_PARAMETER(MetadataDirty);
         }
-
-        /*
-         * NOTE: do NOT flush the whole volume here.  Ext2FlushFile runs once
-         * per open file (e.g. Ext2FlushFiles iterates every Fcb at shutdown /
-         * dismount); a per-file full-volume CcFlushCache would mean N
-         * full-volume flushes and stalls system shutdown.  The deferred
-         * journal commit and the single full-volume metadata flush are done
-         * once at the volume level (Ext2FlushVolume -> Ext2FlushVcb), which
-         * runs right after the per-file pass; the inode home blocks saved
-         * above reach disk there.
-         */
 
     } __finally {
 
@@ -135,6 +175,31 @@ Ext2FlushFile (
     }
 
     return IoStatus.Status;
+}
+
+NTSTATUS
+Ext2FlushVolume (
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_VCB            Vcb,
+    IN BOOLEAN              bShutDown
+)
+{
+    DEBUG(DL_INF, ( "Ext2FlushVolume: Flushing Vcb ...\n"));
+
+    ExAcquireSharedStarveExclusive(&Vcb->PagingIoResource, TRUE);
+    ExReleaseResourceLite(&Vcb->PagingIoResource);
+
+    return Ext2FlushVcb(Vcb);
+}
+
+NTSTATUS
+Ext2FlushFile (
+    IN PEXT2_IRP_CONTEXT    IrpContext,
+    IN PEXT2_FCB            Fcb,
+    IN PEXT2_CCB            Ccb
+)
+{
+    return Ext2FlushFileInternal(IrpContext, Fcb, Ccb, TRUE);
 }
 
 NTSTATUS
@@ -150,6 +215,7 @@ Ext2FlushFiles(
     PLIST_ENTRY     ListEntry;
     LIST_ENTRY      FlushList;
     PEXT2_FLUSH_FCB_ENTRY Entry;
+    NTSTATUS        Status;
 
     if (IsVcbReadOnly(Vcb)) {
         return STATUS_SUCCESS;
@@ -188,10 +254,20 @@ Ext2FlushFiles(
         Ext2FreePool(Entry, EXT2_FLIST_MAGIC);
 
         ExAcquireResourceExclusiveLite(&Fcb->MainResource, TRUE);
-        Ext2FlushFile(IrpContext, Fcb, NULL);
+        /* No per-file journal force — one commit after the loop. */
+        Status = Ext2FlushFileInternal(IrpContext, Fcb, NULL, FALSE);
+        if (NT_SUCCESS(IoStatus.Status) && !NT_SUCCESS(Status)) {
+            IoStatus.Status = Status;
+        }
         ExReleaseResourceLite(&Fcb->MainResource);
 
         Ext2ReleaseFcb(Fcb);
+    }
+
+    /* Single journal barrier for the whole bulk flush (shutdown/dismount). */
+    Status = Ext2JournalForceCommit(Vcb);
+    if (NT_SUCCESS(IoStatus.Status) && !NT_SUCCESS(Status)) {
+        IoStatus.Status = Status;
     }
 
     return IoStatus.Status;

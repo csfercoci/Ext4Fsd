@@ -420,15 +420,13 @@ Ext2OrphanDel(
 
 /*
  * Mount-time replay. Called after Ext2RecoverJournal has
- * replayed the log. Walks s_last_orphan chain, finishing each
- * unfinished delete (i_nlink == 0).
+ * replayed the log. Walks s_last_orphan chain:
+ *   - i_nlink == 0: finish unfinished delete (truncate to 0 + free inode)
+ *   - i_nlink > 0:  finish truncate-orphan (free blocks past i_size, keep inode)
  *
- * MVP: only handles i_nlink == 0 case (truncate-orphan with
- * nlink>0 is not yet emitted by this driver). For each entry
- * we open a top-level transaction, build a transient MCB to
- * reuse Ext2TruncateFile (frees blocks + extents/indirects),
- * then free the inode. SB pointer advanced and persisted per
- * entry so partial replay across crash is safe.
+ * For each entry we open a top-level transaction, build a transient MCB to
+ * reuse Ext2TruncateFile (frees blocks + extents/indirects). SB pointer
+ * advanced and persisted per entry so partial replay across crash is safe.
  *
  * No-op for read-only mounts and for volumes without a journal.
  */
@@ -454,7 +452,8 @@ Ext2ProcessOrphanList(
         PEXT2_MCB   Mcb = NULL;
         ULONG       next;
         BOOLEAN     OwnsTxn = FALSE;
-        LARGE_INTEGER Zero;
+        LARGE_INTEGER Target;
+        NTSTATUS    TruncStatus;
 
         Mcb = Ext2AllocateMcb(Vcb, NULL, NULL, 0);
         if (!Mcb) {
@@ -481,8 +480,17 @@ Ext2ProcessOrphanList(
 
         if (Mcb->Inode.i_nlink == 0) {
             /* finish unfinished delete */
-            Zero.QuadPart = 0;
-            (void)Ext2TruncateFile(IrpContext, Vcb, Mcb, &Zero);
+            Target.QuadPart = 0;
+            TruncStatus = Ext2TruncateFile(IrpContext, Vcb, Mcb, &Target);
+            if (!NT_SUCCESS(TruncStatus)) {
+                DEBUG(DL_ERR, ("Ext2ProcessOrphanList: truncate delete ino=%xh failed %xh\n",
+                               ino, TruncStatus));
+                if (OwnsTxn)
+                    Ext2JournalStop(IrpContext, Vcb);
+                Ext2FreeMcb(Vcb, Mcb);
+                Status = TruncStatus;
+                break;
+            }
             /* clear NEXT_ORPHAN before final SaveInode so dtime
                serializes as deletion time, not chain pointer */
             Mcb->Inode.i_dtime = 0;
@@ -491,9 +499,20 @@ Ext2ProcessOrphanList(
                           S_ISDIR(Mcb->Inode.i_mode) ? EXT2_FT_DIR
                                                      : EXT2_FT_REG_FILE);
         } else {
-            /* truncate-orphan path — not emitted by this driver yet,
-               but tolerate by just splicing out */
-            DEBUG(DL_WRN, ("Ext2ProcessOrphanList: ino=%xh nlink>0 skipping truncate\n", ino));
+            /* truncate-orphan: free blocks past current i_size, keep inode */
+            Target.QuadPart = (LONGLONG)Mcb->Inode.i_size;
+            TruncStatus = Ext2TruncateFile(IrpContext, Vcb, Mcb, &Target);
+            if (!NT_SUCCESS(TruncStatus)) {
+                DEBUG(DL_ERR, ("Ext2ProcessOrphanList: truncate orphan ino=%xh failed %xh\n",
+                               ino, TruncStatus));
+                if (OwnsTxn)
+                    Ext2JournalStop(IrpContext, Vcb);
+                Ext2FreeMcb(Vcb, Mcb);
+                Status = TruncStatus;
+                break;
+            }
+            Mcb->Inode.i_dtime = 0;
+            Ext2SaveInode(IrpContext, Vcb, &Mcb->Inode);
         }
 
         /* splice head -> next, persist */

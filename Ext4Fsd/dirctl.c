@@ -821,9 +821,15 @@ Ext2QueryDirectory (IN PEXT2_IRP_CONTEXT IrpContext)
             __leave;
         }
 
+        /*
+         * Read whole directory blocks (not one dentry at a time).  Explorer
+         * folder-size / search issues many QueryDirectory calls; per-entry
+         * Ext2ReadInode was O(entries) small I/Os.  One block covers many
+         * dentries and reuses the volume cache / inode-cache fill.
+         */
         pDir = Ext2AllocatePool(
                    PagedPool,
-                   sizeof(EXT2_DIR_ENTRY2),
+                   BLOCK_SIZE,
                    EXT2_DENTRY_MAGIC
                );
 
@@ -833,7 +839,7 @@ Ext2QueryDirectory (IN PEXT2_IRP_CONTEXT IrpContext)
             __leave;
         }
 
-        INC_MEM_COUNT(PS_DIR_ENTRY, pDir, sizeof(EXT2_DIR_ENTRY2));
+        INC_MEM_COUNT(PS_DIR_ENTRY, pDir, BLOCK_SIZE);
         ByteOffset = FileIndex;
 
         DEBUG(DL_CP, ("Ex2QueryDirectory: Dir: %wZ Index=%xh Pattern : %wZ.\n",
@@ -842,149 +848,191 @@ Ext2QueryDirectory (IN PEXT2_IRP_CONTEXT IrpContext)
         while ((ByteOffset < Mcb->Inode.i_size) &&
                 (CEILING_ALIGNED(ULONG, fc.efc_start, 8) < Length)) {
 
-            RtlZeroMemory(pDir, sizeof(EXT2_DIR_ENTRY2));
+            ULONG BlockBase;
+            ULONG BlockEnd;
+            ULONG OffsetInBlock;
+            ULONG BytesRead = 0;
+            PEXT2_DIR_ENTRY2 de;
+
+            BlockBase = ByteOffset & ~((ULONG)BLOCK_SIZE - 1);
+            OffsetInBlock = ByteOffset - BlockBase;
+            BlockEnd = BlockBase + BLOCK_SIZE;
+            if ((ULONGLONG)BlockEnd > (ULONGLONG)Mcb->Inode.i_size) {
+                BlockEnd = (ULONG)Mcb->Inode.i_size;
+            }
 
             Status = Ext2ReadInode(
                          IrpContext,
                          Vcb,
                          Mcb,
-                         (ULONGLONG)ByteOffset,
+                         (ULONGLONG)BlockBase,
                          (PVOID)pDir,
-                         sizeof(EXT2_DIR_ENTRY2),
+                         BlockEnd - BlockBase,
                          FALSE,
-                         &EntrySize);
+                         &BytesRead);
 
-            if (!NT_SUCCESS(Status)) {
+            if (!NT_SUCCESS(Status) || BytesRead < OffsetInBlock + EXT2_DIR_REC_LEN(1)) {
+                if (NT_SUCCESS(Status) && BytesRead == 0) {
+                    Status = STATUS_NO_MORE_FILES;
+                }
                 DbgBreak();
                 __leave;
             }
 
-            if (pDir->rec_len == 0) {
-                RecLen = BLOCK_SIZE - (ByteOffset & (BLOCK_SIZE - 1));
-            } else {
-                RecLen = ext3_rec_len_from_disk(pDir->rec_len);
-            }
+            while (OffsetInBlock + EXT2_DIR_REC_LEN(0) <= BytesRead &&
+                   ByteOffset < Mcb->Inode.i_size &&
+                   CEILING_ALIGNED(ULONG, fc.efc_start, 8) < Length) {
 
-            if (!pDir->inode || pDir->inode >= INODES_COUNT) {
-                goto ProcessNextEntry;
-            }
+                de = (PEXT2_DIR_ENTRY2)((PUCHAR)pDir + OffsetInBlock);
 
-            /* skip . and .. */
-            if ((pDir->name_len == 1 && pDir->name[0] == '.') ||
-                    (pDir->name_len == 2 && pDir->name[0] == '.' && pDir->name[1] == '.' )) {
-                goto ProcessNextEntry;
-            }
-
-            Oem.Buffer = pDir->name;
-            Oem.Length = (pDir->name_len & 0xff);
-            Oem.MaximumLength = Oem.Length;
-
-            if (Ext2IsWearingCloak(Vcb, &Oem)) {
-                goto ProcessNextEntry;
-            }
-
-            NameLen = (USHORT) Ext2OEMToUnicodeSize(Vcb, &Oem);
-
-            if (NameLen <= 0) {
-                DEBUG(DL_CP, ("Ext2QueryDirectory: failed to count unicode length for inode: %xh\n",
-                              pDir->inode));
-                Status = STATUS_INSUFFICIENT_RESOURCES;
-                break;
-            }
-
-            if ( Unicode.Buffer != NULL && Unicode.MaximumLength > NameLen) {
-                /* reuse buffer */
-            } else {
-                /* free and re-allocate it */
-                if (Unicode.Buffer) {
-                    DEC_MEM_COUNT(PS_INODE_NAME,
-                                  Unicode.Buffer,
-                                  Unicode.MaximumLength);
-                    Ext2FreePool(Unicode.Buffer, EXT2_INAME_MAGIC);
+                if (de->rec_len == 0) {
+                    RecLen = BLOCK_SIZE - OffsetInBlock;
+                } else {
+                    RecLen = ext3_rec_len_from_disk(de->rec_len);
                 }
-                Unicode.MaximumLength = NameLen + 2;
-                Unicode.Buffer = Ext2AllocatePool(
-                                     PagedPool, Unicode.MaximumLength,
-                                     EXT2_INAME_MAGIC
-                                 );
-                if (!Unicode.Buffer) {
-                    DEBUG(DL_ERR, ( "Ex2QueryDirectory: failed to "
-                                    "allocate InodeFileName.\n"));
+
+                if (RecLen < EXT2_DIR_REC_LEN(0) ||
+                    OffsetInBlock + RecLen > BytesRead) {
+                    /* corrupt / end of usable data in this block */
+                    ByteOffset = BlockBase + BLOCK_SIZE;
+                    Ccb->filp.f_pos = ByteOffset;
+                    break;
+                }
+
+                if (!de->inode || de->inode >= INODES_COUNT) {
+                    goto ProcessNextEntry;
+                }
+
+                /* skip . and .. */
+                if ((de->name_len == 1 && de->name[0] == '.') ||
+                        (de->name_len == 2 && de->name[0] == '.' && de->name[1] == '.' )) {
+                    goto ProcessNextEntry;
+                }
+
+                Oem.Buffer = de->name;
+                Oem.Length = (de->name_len & 0xff);
+                Oem.MaximumLength = Oem.Length;
+
+                if (Ext2IsWearingCloak(Vcb, &Oem)) {
+                    goto ProcessNextEntry;
+                }
+
+                NameLen = (USHORT) Ext2OEMToUnicodeSize(Vcb, &Oem);
+
+                if (NameLen <= 0) {
+                    DEBUG(DL_CP, ("Ext2QueryDirectory: failed to count unicode length for inode: %xh\n",
+                                  de->inode));
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                    goto errorout;
+                }
+
+                if ( Unicode.Buffer != NULL && Unicode.MaximumLength > NameLen) {
+                    /* reuse buffer */
+                } else {
+                    /* free and re-allocate it */
+                    if (Unicode.Buffer) {
+                        DEC_MEM_COUNT(PS_INODE_NAME,
+                                      Unicode.Buffer,
+                                      Unicode.MaximumLength);
+                        Ext2FreePool(Unicode.Buffer, EXT2_INAME_MAGIC);
+                    }
+                    Unicode.MaximumLength = NameLen + 2;
+                    Unicode.Buffer = Ext2AllocatePool(
+                                         PagedPool, Unicode.MaximumLength,
+                                         EXT2_INAME_MAGIC
+                                     );
+                    if (!Unicode.Buffer) {
+                        DEBUG(DL_ERR, ( "Ex2QueryDirectory: failed to "
+                                        "allocate InodeFileName.\n"));
+                        Status = STATUS_INSUFFICIENT_RESOURCES;
+                        __leave;
+                    }
+                    INC_MEM_COUNT(PS_INODE_NAME, Unicode.Buffer, Unicode.MaximumLength);
+                }
+
+                Unicode.Length = 0;
+                RtlZeroMemory(Unicode.Buffer, Unicode.MaximumLength);
+
+                Status = Ext2OEMToUnicode(Vcb, &Unicode, &Oem);
+                if (!NT_SUCCESS(Status)) {
+                    DEBUG(DL_ERR, ( "Ex2QueryDirectory: Ext2OEMtoUnicode failed with %xh.\n", Status));
                     Status = STATUS_INSUFFICIENT_RESOURCES;
                     __leave;
                 }
-                INC_MEM_COUNT(PS_INODE_NAME, Unicode.Buffer, Unicode.MaximumLength);
-            }
 
-            Unicode.Length = 0;
-            RtlZeroMemory(Unicode.Buffer, Unicode.MaximumLength);
+                DEBUG(DL_CP, ( "Ex2QueryDirectory: process inode: %xh / %wZ (%d).\n",
+                               de->inode, &Unicode, Unicode.Length));
 
-            Status = Ext2OEMToUnicode(Vcb, &Unicode, &Oem);
-            if (!NT_SUCCESS(Status)) {
-                DEBUG(DL_ERR, ( "Ex2QueryDirectory: Ext2OEMtoUnicode failed with %xh.\n", Status));
-                Status = STATUS_INSUFFICIENT_RESOURCES;
-                __leave;
-            }
+                if (FsRtlDoesNameContainWildCards(
+                            &(Ccb->DirectorySearchPattern)) ?
+                        FsRtlIsNameInExpression(
+                            &(Ccb->DirectorySearchPattern),
+                            &Unicode,
+                            TRUE,
+                            NULL) :
+                        !RtlCompareUnicodeString(
+                            &(Ccb->DirectorySearchPattern),
+                            &Unicode,
+                            TRUE)           ) {
 
-            DEBUG(DL_CP, ( "Ex2QueryDirectory: process inode: %xh / %wZ (%d).\n",
-                           pDir->inode, &Unicode, Unicode.Length));
+                    Status = Ext2ProcessEntry(
+                                 IrpContext,
+                                 Vcb,
+                                 Fcb,
+                                 fi,
+                                 de->inode,
+                                 Buffer,
+                                 CEILING_ALIGNED(ULONG, fc.efc_start, 8),
+                                 Length - CEILING_ALIGNED(ULONG, fc.efc_start, 8),
+                                 ByteOffset,
+                                 &Unicode,
+                                 &EntrySize,
+                                 ReturnSingleEntry
+                             );
 
-            if (FsRtlDoesNameContainWildCards(
-                        &(Ccb->DirectorySearchPattern)) ?
-                    FsRtlIsNameInExpression(
-                        &(Ccb->DirectorySearchPattern),
-                        &Unicode,
-                        TRUE,
-                        NULL) :
-                    !RtlCompareUnicodeString(
-                        &(Ccb->DirectorySearchPattern),
-                        &Unicode,
-                        TRUE)           ) {
-
-                Status = Ext2ProcessEntry(
-                             IrpContext,
-                             Vcb,
-                             Fcb,
-                             fi,
-                             pDir->inode,
-                             Buffer,
-                             CEILING_ALIGNED(ULONG, fc.efc_start, 8),
-                             Length - CEILING_ALIGNED(ULONG, fc.efc_start, 8),
-                             ByteOffset,
-                             &Unicode,
-                             &EntrySize,
-                             ReturnSingleEntry
-                         );
-
-                if (NT_SUCCESS(Status)) {
-                    if (EntrySize > 0) {
-                        fc.efc_prev  = CEILING_ALIGNED(ULONG, fc.efc_start, 8);
-                        fc.efc_start = fc.efc_prev + EntrySize;
-                    } else {
-                        DbgBreak();
-                    }
-                } else {
-                    if (Status == STATUS_BUFFER_OVERFLOW) {
-                        if (fc.efc_start == 0) {
-                            fc.efc_start = EntrySize;
+                    if (NT_SUCCESS(Status)) {
+                        if (EntrySize > 0) {
+                            fc.efc_prev  = CEILING_ALIGNED(ULONG, fc.efc_start, 8);
+                            fc.efc_start = fc.efc_prev + EntrySize;
                         } else {
-                            Status = STATUS_SUCCESS;
+                            DbgBreak();
                         }
                     } else {
-                        __leave;
+                        if (Status == STATUS_BUFFER_OVERFLOW) {
+                            if (fc.efc_start == 0) {
+                                fc.efc_start = EntrySize;
+                            } else {
+                                Status = STATUS_SUCCESS;
+                            }
+                        } else {
+                            __leave;
+                        }
+                        goto errorout;
                     }
+                }
+
+ProcessNextEntry:
+
+                OffsetInBlock += RecLen;
+                ByteOffset += RecLen;
+                Ccb->filp.f_pos = ByteOffset;
+
+                if (fc.efc_start && ReturnSingleEntry) {
+                    Status = STATUS_SUCCESS;
+                    goto errorout;
+                }
+
+                /* stay within this directory block */
+                if (ByteOffset >= BlockEnd) {
                     break;
                 }
             }
 
-ProcessNextEntry:
-
-            ByteOffset += RecLen;
-            Ccb->filp.f_pos = ByteOffset;
-
-            if (fc.efc_start && ReturnSingleEntry) {
-                Status = STATUS_SUCCESS;
-                goto errorout;
+            /* advance to next block if inner loop exhausted this one */
+            if (ByteOffset < BlockEnd && ByteOffset < Mcb->Inode.i_size &&
+                OffsetInBlock + EXT2_DIR_REC_LEN(0) > BytesRead) {
+                ByteOffset = BlockBase + BLOCK_SIZE;
+                Ccb->filp.f_pos = ByteOffset;
             }
         }
 
@@ -1014,7 +1062,7 @@ errorout:
 
         if (pDir != NULL) {
             Ext2FreePool(pDir, EXT2_DENTRY_MAGIC);
-            DEC_MEM_COUNT(PS_DIR_ENTRY, pDir, sizeof(EXT2_DIR_ENTRY2));
+            DEC_MEM_COUNT(PS_DIR_ENTRY, pDir, BLOCK_SIZE);
         }
 
         if (Unicode.Buffer != NULL) {
