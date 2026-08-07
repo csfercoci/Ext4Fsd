@@ -290,6 +290,62 @@ Ext2ResetOrderedDirtyRanges(IN PEXT2_FCB Fcb)
     KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
 }
 
+NTSTATUS
+Ext2FlushFcbOrderedData(IN PEXT2_FCB Fcb)
+{
+    EXT2_ORDERED_DIRTY_RANGE Ranges[EXT2_ORDERED_DIRTY_RANGE_COUNT];
+    KIRQL Irql;
+    ULONG Count;
+    ULONG i;
+    IO_STATUS_BLOCK IoStatus = {0};
+
+    if (!Fcb) {
+        return STATUS_SUCCESS;
+    }
+
+    KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
+    Count = Fcb->OrderedDirtyRangeCount;
+    if (Count > 0) {
+        RtlCopyMemory(Ranges, Fcb->OrderedDirtyRanges,
+                      Count * sizeof(EXT2_ORDERED_DIRTY_RANGE));
+        Fcb->OrderedDirtyRangeCount = 0;
+    }
+    KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
+
+    if (Count == 0) {
+        /* No tracked windows: full-file flush (legacy / untracked dirtiness). */
+        CcFlushCache(&Fcb->SectionObject, NULL, 0, &IoStatus);
+        return IoStatus.Status;
+    }
+
+    for (i = 0; i < Count; i++) {
+        LONGLONG Pos = Ranges[i].Start;
+
+        while (Pos < Ranges[i].End) {
+            IO_STATUS_BLOCK RangeStatus = {0};
+            LARGE_INTEGER Offset;
+            ULONG Length;
+            LONGLONG Remaining = Ranges[i].End - Pos;
+
+            Length = (Remaining > (LONGLONG)(256 * 1024 * 1024)) ?
+                     (256 * 1024 * 1024) : (ULONG)Remaining;
+            Offset.QuadPart = Pos;
+            CcFlushCache(&Fcb->SectionObject, &Offset, Length, &RangeStatus);
+            if (!NT_SUCCESS(RangeStatus.Status)) {
+                ULONG j;
+
+                for (j = 0; j < Count; j++) {
+                    Ext2MarkOrderedDirtyRange(Fcb, Ranges[j].Start, Ranges[j].End);
+                }
+                return RangeStatus.Status;
+            }
+            Pos += Length;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
 VOID
 Ext2UnlinkFcb(IN PEXT2_FCB Fcb)
 {

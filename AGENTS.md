@@ -10,15 +10,16 @@ Toolchain: Visual Studio 2026 (v18) + WDK 10.0.26100.0.
 ```
 build.cmd              # Debug x64 (default)
 build.cmd release      # Release x64
-install.cmd [release]  # Stops driver, copies .sys, sc create+start (auto-elevates)
+install.cmd            # Debug x64 (default; matches build.cmd)
+install.cmd release    # Release x64 — exits non-zero if live replace needs reboot
 ```
 
-Manual msbuild:
+Manual msbuild (pass SolutionDir=repo root so OutDir is Ext4Fsd\{Config}\x64\):
 ```
-cmd /c "call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && msbuild Ext4Fsd\Ext4Fsd.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:SpectreMitigation=false /m"
+cmd /c "call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && msbuild Ext4Fsd\Ext4Fsd.vcxproj /p:Configuration=Debug /p:Platform=x64 /p:SpectreMitigation=false /p:SolutionDir=%CD%\ /m"
 ```
 
-**Output filename gotcha**: vcxproj `TargetName=Ext2Fsd`. Binary is `Ext4Fsd\Ext4Fsd\{Debug|Release}\x64\Ext2Fsd.sys` (NOT `Ext4Fsd.sys`). Service name also `Ext2Fsd`. Installs to `%SystemRoot%\System32\drivers\Ext2Fsd.sys`.
+**Output filename gotcha**: vcxproj `TargetName=Ext2Fsd`. Binary is `Ext4Fsd\{Debug|Release}\x64\Ext2Fsd.sys` (NOT `Ext4Fsd.sys`). Service name also `Ext2Fsd`. Installs to `%SystemRoot%\System32\drivers\Ext2Fsd.sys`.
 
 ## Verify a change
 
@@ -34,8 +35,8 @@ cmd /c "call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary
 
 ## Notable recent behavior (committed)
 
-- Default CodePage **utf8** when registry unset/invalid; volume inherits global; surrogate-aware UTF-8 codec
+- Default CodePage **utf8** when registry unset; invalid registry falls back to **default** (system ANSI); volume inherits global; surrogate-aware UTF-8 codec
 - Inode cache, MCB child hash, per-FCB ordered dirty ranges, rename preallocate-before-delete
-- Journal: real commit ordering + disk flush barriers, `JournalCommittedSeq` fsync wait, error propagation
-- Orphan on truncate fail / truncate-orphan nlink>0; bitmaps journaled; failed commit requeues handle
-- Perf: 15ms fsync batch, bulk flush one commit, ranged CcFlush; dir enum reads whole blocks
+- Journal: multi-descriptor tags for small blocks; no head rollback after durable commit (abort instead); real commit ordering + disk flush barriers; `JournalCommittedSeq` fsync wait
+- Orphan on truncate fail / truncate-orphan nlink>0 (FCB syncs i_size on async orphan); bitmaps journaled with undo on DirtyMetadata fail; failed commit requeues handle
+- Perf: 15ms fsync batch only when concurrent forcers; bulk flush one commit; shared ordered-range flush; dir enum validates name_len

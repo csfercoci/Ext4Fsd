@@ -1584,13 +1584,15 @@ Again:
 
     if (Index < Length) {
 
-        /* mark block bits as allocated */
+        /* mark block bits as allocated, then journal before publishing
+         * free-count updates so a DirtyMetadata failure cannot leak bits. */
         RtlSetBits(&BlockBitmap, Index, *Number);
 
-        /* journal block bitmap with the same handle as GD/SB */
         Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
-        if (!NT_SUCCESS(Status))
+        if (!NT_SUCCESS(Status)) {
+            RtlClearBits(&BlockBitmap, Index, *Number);
             goto errorout;
+        }
 
         /* update group description */
         {
@@ -1744,12 +1746,20 @@ Again:
         /* clear unused bits */
         RtlInitializeBitMap(&BlockBitmap, (PULONG)bh->b_data, Length);
         Count = min(Length - Index, Number);
-        RtlClearBits(&BlockBitmap, Index, Count);
-
-        /* update group description table */
         {
             ext3_fsblk_t OldFree = ext4_free_blks_count(sb, gd);
-            ULONG NewFree = RtlNumberOfClearBits(&BlockBitmap);
+            ULONG NewFree;
+
+            RtlClearBits(&BlockBitmap, Index, Count);
+            NewFree = RtlNumberOfClearBits(&BlockBitmap);
+
+            Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
+            if (!NT_SUCCESS(Status)) {
+                /* Undo in-core bitmap/counters so concurrent alloc cannot
+                 * reuse blocks that never entered the journal. */
+                RtlSetBits(&BlockBitmap, Index, Count);
+                goto errorout;
+            }
 
             ext4_free_blks_set(sb, gd, (__u32)NewFree);
             Ext2ApplyGroupBlkDelta(Vcb, OldFree, (ext3_fsblk_t)NewFree);
@@ -1757,10 +1767,6 @@ Again:
         }
 
         ext4_block_bitmap_csum_set(sb, Group, gd, bh);
-
-        Status = Ext2DirtyMetadata(IrpContext, Vcb, bh);
-        if (!NT_SUCCESS(Status))
-            goto errorout;
 
         Ext2SaveGroup(IrpContext, Vcb, Group);
 

@@ -95,58 +95,15 @@ Ext2FlushFileInternal (
          * Prefer ordered dirty ranges (data=ordered) over full-file flush.
          * Explorer copy + multi-flush then only rewrites recently dirtied
          * windows instead of the entire growing target file each time.
+         * Do not clear FCB_FILE_MODIFIED until force-commit succeeds so a
+         * failed journal barrier still sees the file as ordered-dirty.
          */
-        {
-            EXT2_ORDERED_DIRTY_RANGE Ranges[EXT2_ORDERED_DIRTY_RANGE_COUNT];
-            KIRQL Irql;
-            ULONG Count;
-            ULONG i;
-
-            KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
-            Count = Fcb->OrderedDirtyRangeCount;
-            if (Count > 0) {
-                RtlCopyMemory(Ranges, Fcb->OrderedDirtyRanges,
-                              Count * sizeof(EXT2_ORDERED_DIRTY_RANGE));
-                Fcb->OrderedDirtyRangeCount = 0;
-            }
-            KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
-
-            if (Count > 0) {
-                IoStatus.Status = STATUS_SUCCESS;
-                for (i = 0; i < Count; i++) {
-                    LONGLONG Pos = Ranges[i].Start;
-
-                    while (Pos < Ranges[i].End) {
-                        IO_STATUS_BLOCK RangeStatus = {0};
-                        LARGE_INTEGER Offset;
-                        ULONG Length;
-                        LONGLONG Remaining = Ranges[i].End - Pos;
-
-                        Length = (Remaining > (LONGLONG)(256 * 1024 * 1024)) ?
-                                 (256 * 1024 * 1024) : (ULONG)Remaining;
-                        Offset.QuadPart = Pos;
-                        CcFlushCache(&Fcb->SectionObject, &Offset, Length, &RangeStatus);
-                        if (!NT_SUCCESS(RangeStatus.Status)) {
-                            ULONG j;
-                            for (j = 0; j < Count; j++) {
-                                Ext2MarkOrderedDirtyRange(Fcb, Ranges[j].Start, Ranges[j].End);
-                            }
-                            IoStatus = RangeStatus;
-                            __leave;
-                        }
-                        Pos += Length;
-                    }
-                }
-            } else {
-                CcFlushCache(&(Fcb->SectionObject), NULL, 0, &IoStatus);
-                if (!NT_SUCCESS(IoStatus.Status)) {
-                    __leave;
-                }
-            }
+        Status = Ext2FlushFcbOrderedData(Fcb);
+        if (!NT_SUCCESS(Status)) {
+            IoStatus.Status = Status;
+            __leave;
         }
-
-        Ext2ResetOrderedDirtyRanges(Fcb);
-        ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        IoStatus.Status = STATUS_SUCCESS;
 
         if (IsFlagOn(Fcb->Flags, FCB_ALLOC_IN_WRITE)) {
             Ext2SaveInode(IrpContext, Fcb->Vcb, Fcb->Inode);
@@ -155,18 +112,23 @@ Ext2FlushFileInternal (
         }
 
         /*
-         * Force-commit only when this flush dirtied metadata or the caller
-         * asked for a per-file durability barrier.  Bulk Ext2FlushFiles sets
+         * Per-file path: always force-commit so data=ordered homes and any
+         * metadata from this flush become durable.  Bulk Ext2FlushFiles sets
          * CommitJournal=FALSE and issues one Ext2JournalForceCommit after
-         * all files, matching Linux "one commit for N fsyncs".
+         * all files; ranges stay empty and FCB_FILE_MODIFIED sticks until
+         * that barrier succeeds (caller must clear on success).
          */
         if (CommitJournal) {
             Status = Ext2JournalForceCommit(Fcb->Vcb);
             if (!NT_SUCCESS(Status)) {
                 IoStatus.Status = Status;
+                __leave;
             }
-        } else {
-            UNREFERENCED_PARAMETER(MetadataDirty);
+            Ext2ResetOrderedDirtyRanges(Fcb);
+            ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        } else if (!MetadataDirty) {
+            /* Bulk path: data is on disk; leave MODIFIED until volume commit. */
+            ;
         }
 
     } __finally {
@@ -268,6 +230,22 @@ Ext2FlushFiles(
     Status = Ext2JournalForceCommit(Vcb);
     if (NT_SUCCESS(IoStatus.Status) && !NT_SUCCESS(Status)) {
         IoStatus.Status = Status;
+    }
+
+    /* Clear ordered state only after the volume commit barrier succeeds. */
+    if (NT_SUCCESS(Status)) {
+        ExAcquireResourceSharedLite(&Vcb->FcbLock, TRUE);
+        for (ListEntry = Vcb->FcbList.Flink;
+             ListEntry != &Vcb->FcbList;
+             ListEntry = ListEntry->Flink) {
+
+            Fcb = CONTAINING_RECORD(ListEntry, EXT2_FCB, Next);
+            if (IsDirectory(Fcb))
+                continue;
+            Ext2ResetOrderedDirtyRanges(Fcb);
+            ClearFlag(Fcb->Flags, FCB_FILE_MODIFIED);
+        }
+        ExReleaseResourceLite(&Vcb->FcbLock);
     }
 
     return IoStatus.Status;

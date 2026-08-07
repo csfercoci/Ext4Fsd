@@ -892,7 +892,10 @@ Ext2QueryDirectory (IN PEXT2_IRP_CONTEXT IrpContext)
                 }
 
                 if (RecLen < EXT2_DIR_REC_LEN(0) ||
-                    OffsetInBlock + RecLen > BytesRead) {
+                    (RecLen & 3) != 0 ||
+                    OffsetInBlock + RecLen > BytesRead ||
+                    RecLen < (ULONG)EXT2_DIR_REC_LEN(de->name_len) ||
+                    OffsetInBlock + 8u + (ULONG)(de->name_len & 0xff) > BytesRead) {
                     /* corrupt / end of usable data in this block */
                     ByteOffset = BlockBase + BLOCK_SIZE;
                     Ccb->filp.f_pos = ByteOffset;

@@ -351,11 +351,14 @@ Ext2QueryRegistrySettings(IN PUNICODE_STRING  RegistryPath)
                      &UniName,
                      FALSE);
         if (!NT_SUCCESS(Status)) {
+            /* Invalid registry value: keep legacy "default" (system ANSI)
+             * so an upgrade does not silently reinterpret existing volumes. */
             DEBUG(DL_ERR, ( "Ext2QueryParameters: Wrong CodePage %wZ ...\n", &UniName));
-            RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"utf8\0", 5);
+            RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"default\0", 8);
         }
     } else {
-        DEBUG(DL_ERR, ( "Ext2QueryParameters: CodePage not specified.\n"));
+        /* Fresh install / unset: prefer utf8 (modern Linux volumes). */
+        DEBUG(DL_INF, ( "Ext2QueryParameters: CodePage not specified; defaulting to utf8.\n"));
         RtlCopyMemory(&(Ext2Global->Codepage.AnsiName[0]),"utf8\0", 5);
     }
     Ext2Global->Codepage.AnsiName[CODEPAGE_MAXLEN - 1] = 0;

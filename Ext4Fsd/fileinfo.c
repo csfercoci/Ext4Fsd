@@ -766,16 +766,28 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                     /* truncate file blocks */
                     Status = Ext2TruncateFile(IrpContext, Vcb, Mcb, &AllocationSize);
 
-                    if (NT_SUCCESS(Status)) {
-                        ClearLongFlag(Fcb->Flags, FCB_ALLOC_IN_CREATE);
-                        NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
-                        Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
-                        if (Mcb->Inode.i_size > (loff_t)AllocationSize.QuadPart) {
-                            Mcb->Inode.i_size = AllocationSize.QuadPart;
+                    /*
+                     * Truncate-orphan may have already journaled a smaller
+                     * i_size before free failed; keep FCB in sync either way.
+                     */
+                    if (NT_SUCCESS(Status) ||
+                        Mcb->Inode.i_size < (loff_t)Fcb->Header.FileSize.QuadPart) {
+                        if (NT_SUCCESS(Status)) {
+                            ClearLongFlag(Fcb->Flags, FCB_ALLOC_IN_CREATE);
+                            Fcb->Header.AllocationSize.QuadPart = AllocationSize.QuadPart;
+                            if (Mcb->Inode.i_size > (loff_t)AllocationSize.QuadPart) {
+                                Mcb->Inode.i_size = AllocationSize.QuadPart;
+                            }
                         }
                         Fcb->Header.FileSize.QuadPart = Mcb->Inode.i_size;
                         if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
                             Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
+                        }
+                        if (NT_SUCCESS(Status)) {
+                            NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
+                        } else if (CcIsFileCached(FileObject)) {
+                            CcSetFileSizes(FileObject,
+                                           (PCC_FILE_SIZES)(&(Fcb->Header.AllocationSize)));
                         }
                     }
 
@@ -904,6 +916,16 @@ Ext2SetFileInformation (IN PEXT2_IRP_CONTEXT IrpContext)
                         SetFlag(FileObject->Flags, FO_FILE_MODIFIED);
                         SetLongFlag(Fcb->Flags, FCB_FILE_MODIFIED);
                         NotifyFilter = FILE_NOTIFY_CHANGE_SIZE;
+                    } else if (Mcb->Inode.i_size < (loff_t)Fcb->Header.FileSize.QuadPart) {
+                        /* Orphan prelude already shrunk i_size; align FCB. */
+                        Fcb->Header.FileSize.QuadPart = Mcb->Inode.i_size;
+                        if (Fcb->Header.ValidDataLength.QuadPart > Fcb->Header.FileSize.QuadPart) {
+                            Fcb->Header.ValidDataLength.QuadPart = Fcb->Header.FileSize.QuadPart;
+                        }
+                        if (CcIsFileCached(FileObject)) {
+                            CcSetFileSizes(FileObject,
+                                           (PCC_FILE_SIZES)(&(Fcb->Header.AllocationSize)));
+                        }
                     }
                 }
             }
@@ -1222,6 +1244,11 @@ Ext2TruncateFile(
      * i_size already at the target so mount replay truncates to i_size and
      * reclaims the leftover blocks.  Delete path already set nlink==0 and
      * called OrphanAdd — skip here.
+     *
+     * When TruncateOrphan is set, i_size is already the target before free
+     * runs.  Callers must treat a failed free as an async orphan: the on-disk
+     * size may already be shrunk; sync FCB FileSize/VDL to Mcb->Inode.i_size
+     * even when status fails (see SetEndOfFile / SetAllocation).
      */
     if (Mcb->Inode.i_nlink > 0 &&
         EXT4_SB(&Vcb->sb)->s_journal != NULL &&
@@ -1259,7 +1286,7 @@ Ext2TruncateFile(
             Ext2OrphanDel(IrpContext, Vcb, &Mcb->Inode);
             Ext2SaveInode(IrpContext, Vcb, &Mcb->Inode);
         }
-        /* on failure leave on orphan list for mount replay */
+        /* on failure leave on orphan list for mount replay; i_size already target */
     }
 
     if (OwnsTxn) {

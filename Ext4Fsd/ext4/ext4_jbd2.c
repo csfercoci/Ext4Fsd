@@ -15,6 +15,9 @@ static inline int ext4_handle_valid(handle_t *handle)
 
 #define MAX_HANDLE_REVOKES   256
 
+/* Descriptor blocks for one commit (256 tags / worst-case small block). */
+#define MAX_DESC_BLOCKS      16
+
 #define EXT2_COMMIT_INTERVAL_SECONDS  10
 /* Linux jbd2 default commit interval is 5s.  A short delay here makes every
  * sustained write/delete workload commit (and data=ordered flush) dozens of
@@ -102,30 +105,56 @@ static int journal_commit_sync(struct ext4_handle *eh)
     int                        blocksize = eh->sb->s_blocksize;
     unsigned long              head, first, last;
     unsigned long              transaction_start;
-    unsigned long              saved_head = 0;
-    unsigned long              saved_free = 0;
-    tid_t                      saved_tid = 0;
-    BOOLEAN                    advanced = FALSE;
+    BOOLEAN                    commit_durable = FALSE;
+    BOOLEAN                    reclaimed = FALSE;
     int                        i, err = 0;
-    unsigned long long         desc_phys, commit_phys;
+    unsigned long long         desc_phys[MAX_DESC_BLOCKS];
+    unsigned long long         commit_phys;
     unsigned long long         data_phys[MAX_HANDLE_BUFFERS];
     unsigned long long         revoke_phys[8];
     struct buffer_head         *jbh;
-    struct buffer_head         *wbufs[MAX_HANDLE_BUFFERS + 16]; /* desc + data + revoke + commit */
+    /* descs + data + revokes + commit */
+    struct buffer_head         *wbufs[MAX_DESC_BLOCKS + MAX_HANDLE_BUFFERS + 16];
     int                        nwbufs = 0;
     int                        nblocks;
+    int                        ndesc = 0;
     int                        nrev_blocks = 0;
     int                        revoke_entry_sz;
     int                        revoke_per_block;
+    size_t                     tag_bytes;
+    int                        tags_per_desc;
     struct buffer_head         *home_bufs[MAX_HANDLE_BUFFERS];
     int                        nhome = 0;
+    int                        buf_idx;
 
     if (eh->nbuffers == 0 && eh->nrevoked == 0)
         return 0;
 
+    if (is_journal_aborted(journal))
+        return -EIO;
+
+    tag_bytes = journal_tag_bytes(journal);
+    if (tag_bytes == 0 || blocksize <= (int)sizeof(journal_header_t))
+        return -EINVAL;
+
+    tags_per_desc = (blocksize - (int)sizeof(journal_header_t)) / (int)tag_bytes;
+    if (tags_per_desc < 1)
+        return -EINVAL;
+
+    /* At least one descriptor block (empty when only revokes). */
+    if (eh->nbuffers > 0)
+        ndesc = (eh->nbuffers + tags_per_desc - 1) / tags_per_desc;
+    else
+        ndesc = 1;
+
+    if (ndesc > MAX_DESC_BLOCKS)
+        return -ENOSPC;
+
     revoke_entry_sz = jbd2_has_feature_64bit(journal) ? 8 : 4;
     revoke_per_block = (blocksize - sizeof(jbd2_journal_revoke_header_t)) / revoke_entry_sz;
     if (eh->nrevoked > 0) {
+        if (revoke_per_block < 1)
+            return -EINVAL;
         nrev_blocks = (eh->nrevoked + revoke_per_block - 1) / revoke_per_block;
         if (nrev_blocks > (int)(sizeof(revoke_phys)/sizeof(revoke_phys[0]))) {
             return -ENOSPC;
@@ -138,37 +167,52 @@ static int journal_commit_sync(struct ext4_handle *eh)
     transaction_start = head;
     first = journal->j_first;
     last = journal->j_last;
-    nblocks = 1 + eh->nbuffers + nrev_blocks + 1; /* descriptor + data + revoke + commit */
+    nblocks = ndesc + eh->nbuffers + nrev_blocks + 1; /* descs + data + revoke + commit */
     if (nblocks > (int)(journal->j_free)) {
         mutex_unlock(&journal->j_checkpoint_mutex);
         return -ENOSPC;
     }
 
-    /* --- Phase 0: Pre-compute all logical → physical mappings --- */
+    /* --- Phase 0: Pre-compute logical → physical mappings ---
+     * Recovery walks [desc][data tags...][desc][data...]... so allocate
+     * journal blocks in that interleaved order (not all descs then all data).
+     */
 
-    /* descriptor block bmap */
-    {
+    buf_idx = 0;
+    for (i = 0; i < ndesc; i++) {
         unsigned long logical_block = head;
+        int n_this;
 
         head++;
         if (head == last)
             head = first;
 
-        err = jbd2_journal_bmap(journal, logical_block, &desc_phys);
+        err = jbd2_journal_bmap(journal, logical_block, &desc_phys[i]);
         if (err)
             goto out_release;
-    }
 
-    for (i = 0; i < eh->nbuffers; i++) {
-        unsigned long logical_block = head;
+        if (eh->nbuffers > 0) {
+            n_this = eh->nbuffers - buf_idx;
+            if (n_this > tags_per_desc)
+                n_this = tags_per_desc;
+        } else {
+            n_this = 0;
+        }
 
-        head++;
-        if (head == last)
-            head = first;
-
-        err = jbd2_journal_bmap(journal, logical_block, &data_phys[i]);
-        if (err)
-            goto out_release;
+        {
+            int k;
+            for (k = 0; k < n_this; k++) {
+                logical_block = head;
+                head++;
+                if (head == last)
+                    head = first;
+                err = jbd2_journal_bmap(journal, logical_block,
+                                        &data_phys[buf_idx + k]);
+                if (err)
+                    goto out_release;
+            }
+        }
+        buf_idx += n_this;
     }
 
     /* revoke descriptor block bmap(s) */
@@ -197,13 +241,17 @@ static int journal_commit_sync(struct ext4_handle *eh)
             goto out_release;
     }
 
-    /* --- Phase 1: Write descriptor block (standard JBD2: descriptor first) --- */
+    /* --- Phase 1+2: Write [descriptor][data copies] groups --- */
 
-    {
+    buf_idx = 0;
+    for (i = 0; i < ndesc; i++) {
         journal_header_t *header;
         char *tag_ptr;
+        char *tag_end;
+        int n_this;
+        int k;
 
-        jbh = sb_getblk_zero(eh->sb, (sector_t)desc_phys);
+        jbh = sb_getblk_zero(eh->sb, (sector_t)desc_phys[i]);
         if (!jbh) {
             err = -ENOMEM;
             goto out_release;
@@ -215,17 +263,39 @@ static int journal_commit_sync(struct ext4_handle *eh)
         header->h_sequence = cpu_to_be32(journal->j_transaction_sequence);
 
         tag_ptr = jbh->b_data + sizeof(journal_header_t);
+        tag_end = jbh->b_data + blocksize;
 
-        for (i = 0; i < eh->nbuffers; i++) {
-            struct buffer_head *bh = eh->buffers[i];
-            journal_block_tag_t *tag = (journal_block_tag_t *)tag_ptr;
+        if (eh->nbuffers > 0) {
+            n_this = eh->nbuffers - buf_idx;
+            if (n_this > tags_per_desc)
+                n_this = tags_per_desc;
+        } else {
+            n_this = 0;
+        }
+
+        for (k = 0; k < n_this; k++) {
+            struct buffer_head *bh = eh->buffers[buf_idx + k];
+            journal_block_tag_t *tag;
+            __u16 flags = 0;
+
+            if (tag_ptr + tag_bytes > tag_end) {
+                err = -EIO;
+                brelse(jbh);
+                goto out_wait_journal;
+            }
+
+            tag = (journal_block_tag_t *)tag_ptr;
+            if (buf_idx + k == eh->nbuffers - 1)
+                flags |= JBD2_FLAG_LAST_TAG;
 
             tag->t_blocknr = cpu_to_be32((__u32)(bh->b_blocknr & 0xFFFFFFFF));
-            tag->t_flags = cpu_to_be16((i == eh->nbuffers - 1) ? JBD2_FLAG_LAST_TAG : 0);
-            tag->t_blocknr_high = cpu_to_be32((__u32)(bh->b_blocknr >> 32));
+            tag->t_flags = cpu_to_be16(flags);
             tag->t_checksum = 0;
+            if (tag_bytes >= sizeof(journal_block_tag_t)) {
+                tag->t_blocknr_high = cpu_to_be32((__u32)(bh->b_blocknr >> 32));
+            }
 
-            tag_ptr += sizeof(journal_block_tag_t);
+            tag_ptr += tag_bytes;
         }
 
         set_buffer_dirty(jbh);
@@ -240,37 +310,29 @@ static int journal_commit_sync(struct ext4_handle *eh)
         wbufs[nwbufs++] = jbh;
         if (err)
             goto out_wait_journal;
-    }
 
-    /* --- Phase 2: Write data copies to journal (standard JBD2: after descriptor) --- */
+        for (k = 0; k < n_this; k++) {
+            struct buffer_head *bh = eh->buffers[buf_idx + k];
 
-    for (i = 0; i < eh->nbuffers; i++) {
-        struct buffer_head *bh = eh->buffers[i];
+            jbh = sb_getblk_zero(eh->sb, (sector_t)data_phys[buf_idx + k]);
+            if (!jbh) {
+                err = -ENOMEM;
+                goto out_wait_journal;
+            }
 
-        jbh = sb_getblk_zero(eh->sb, (sector_t)data_phys[i]);
-        if (!jbh) {
-            err = -ENOMEM;
-            /* Wait/release the buffers already submitted in this phase and
-             * Phase 1 — bailing straight to out_release would leak their
-             * wbufs[] references. */
-            goto out_wait_journal;
+            memcpy(jbh->b_data, bh->b_data, blocksize);
+            set_buffer_dirty(jbh);
+            mark_buffer_dirty(jbh);
+            set_buffer_uptodate(jbh);
+            get_bh(jbh);
+            err = submit_bh(WRITE, jbh);
+            wbufs[nwbufs++] = jbh;
+            if (err)
+                goto out_wait_journal;
+
+            home_bufs[nhome++] = bh;
         }
-
-        memcpy(jbh->b_data, bh->b_data, blocksize);
-        set_buffer_dirty(jbh);
-        mark_buffer_dirty(jbh);
-        set_buffer_uptodate(jbh);
-        /* submit_bh consumes one reference (submit_bh_pin ends with put_bh),
-         * and journal_wait_for_writes brelse's wbufs[] later.  Take an extra
-         * reference so the getblk one survives until that brelse; without it
-         * b_count underflows to -1 and the bh + its pinned BCB leak forever. */
-        get_bh(jbh);
-        err = submit_bh(WRITE, jbh);
-        wbufs[nwbufs++] = jbh;
-        if (err)
-            goto out_wait_journal;
-
-        home_bufs[nhome++] = bh;
+        buf_idx += n_this;
     }
 
     /* --- Phase 2.5: Write revoke descriptor block(s) --- */
@@ -404,15 +466,13 @@ static int journal_commit_sync(struct ext4_handle *eh)
         goto out_release;
     }
 
-    /* --- Phase 5: Update journal head in memory --- */
-
-    saved_head = journal->j_head;
-    saved_free = journal->j_free;
-    saved_tid = journal->j_transaction_sequence;
+    /* Commit record is durable: never roll back j_head/j_free/tid after
+     * this point.  Recovery may still need the journaled copy until homes
+     * are checkpointed; reclaiming that range early would overwrite it. */
+    commit_durable = TRUE;
     journal->j_head = head;
     journal->j_free -= nblocks;
     journal->j_transaction_sequence++;
-    advanced = TRUE;
 
     /* --- Phase 6: Write originals to home locations --- */
 
@@ -443,7 +503,7 @@ static int journal_commit_sync(struct ext4_handle *eh)
         journal->j_tail = journal->j_head;
         journal->j_tail_sequence = journal->j_transaction_sequence;
         journal->j_flags |= JBD2_FLUSHED;
-        advanced = FALSE; /* reclaim done; no rollback needed */
+        reclaimed = TRUE;
     }
 
     goto out_release;
@@ -454,19 +514,21 @@ out_wait_journal:
 
 out_release:
     /*
-     * On failure after j_head/j_free advanced but before reclaim, restore
-     * in-memory journal space so later commits are not permanently ENOSPC.
-     * On-disk journal may still hold a partial txn; recovery is safe because
-     * we never advanced the durable tail past unwritten homes on error paths
-     * that skip the successful reclaim block above.
+     * After a durable commit record, never roll head/free/tid back: the
+     * on-disk log is the only recovery copy until homes are written.
+     * Keep space reserved (j_free already reduced).  Abort after dropping
+     * the mutex so jbd2_journal_abort can update the superblock safely.
      */
-    if (err && advanced) {
-        journal->j_head = saved_head;
-        journal->j_free = saved_free;
-        journal->j_transaction_sequence = saved_tid;
+    {
+        int abort_err = 0;
+
+        if (err && commit_durable && !reclaimed)
+            abort_err = err;
+        mutex_unlock(&journal->j_checkpoint_mutex);
+        if (abort_err)
+            jbd2_journal_abort(journal, abort_err);
+        return err;
     }
-    mutex_unlock(&journal->j_checkpoint_mutex);
-    return err;
 }
 
 /*
@@ -776,50 +838,6 @@ int __ext4_journal_revoke_block(handle_t *handle, ext4_fsblk_t blocknr)
  * frees it.
  */
 static NTSTATUS
-Ext2FlushOrderedDirtyRanges(PEXT2_FCB Fcb)
-{
-    EXT2_ORDERED_DIRTY_RANGE Ranges[EXT2_ORDERED_DIRTY_RANGE_COUNT];
-    LARGE_INTEGER Offset;
-    KIRQL Irql;
-    ULONG Count;
-    ULONG i;
-
-    KeAcquireSpinLock(&Fcb->OrderedDirtyLock, &Irql);
-    Count = Fcb->OrderedDirtyRangeCount;
-    RtlCopyMemory(Ranges, Fcb->OrderedDirtyRanges,
-                  Count * sizeof(EXT2_ORDERED_DIRTY_RANGE));
-    Fcb->OrderedDirtyRangeCount = 0;
-    KeReleaseSpinLock(&Fcb->OrderedDirtyLock, Irql);
-
-    for (i = 0; i < Count; i++) {
-        LONGLONG Pos = Ranges[i].Start;
-
-        while (Pos < Ranges[i].End) {
-            IO_STATUS_BLOCK IoStatus = {0};
-            ULONG Length;
-            LONGLONG Remaining = Ranges[i].End - Pos;
-
-            Length = (Remaining > (LONGLONG)(256 * 1024 * 1024)) ?
-                     (256 * 1024 * 1024) : (ULONG)Remaining;
-            Offset.QuadPart = Pos;
-            CcFlushCache(&Fcb->SectionObject, &Offset, Length, &IoStatus);
-            if (!NT_SUCCESS(IoStatus.Status)) {
-                ULONG j;
-
-                /* Preserve every range for a later ordered-data retry. */
-                for (j = 0; j < Count; j++) {
-                    Ext2MarkOrderedDirtyRange(Fcb, Ranges[j].Start, Ranges[j].End);
-                }
-                return IoStatus.Status;
-            }
-            Pos += Length;
-        }
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
 Ext2FlushDirtyData(PEXT2_VCB Vcb)
 {
     PEXT2_FCB Fcb;
@@ -858,7 +876,7 @@ Ext2FlushDirtyData(PEXT2_VCB Vcb)
                                  EXT2_FLIST_MAGIC);
         if (!Entry) {
             /* Can't defer this one: flush inline. */
-            FlushStatus = Ext2FlushOrderedDirtyRanges(Fcb);
+            FlushStatus = Ext2FlushFcbOrderedData(Fcb);
             if (NT_SUCCESS(Status) && !NT_SUCCESS(FlushStatus)) {
                 Status = FlushStatus;
             }
@@ -879,7 +897,7 @@ Ext2FlushDirtyData(PEXT2_VCB Vcb)
         Fcb = Entry->Fcb;
         Ext2FreePool(Entry, EXT2_FLIST_MAGIC);
 
-        FlushStatus = Ext2FlushOrderedDirtyRanges(Fcb);
+        FlushStatus = Ext2FlushFcbOrderedData(Fcb);
         if (NT_SUCCESS(Status) && !NT_SUCCESS(FlushStatus)) {
             Status = FlushStatus;
         }
@@ -1030,7 +1048,7 @@ Ext2BatchDpc(PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID Syst
  * kjournald -- dedicated journal commit thread per mounted volume.
  *
  * Wakes on:
- * - Batch timer (5ms after first stop) — batches burst writes
+ * - Batch timer (5s after first stop) — batches burst writes
  * - Force-commit signal (fsync/flush) — immediate commit
  * - Safety-net timeout (10s) — catches stragglers
  *
@@ -1209,6 +1227,7 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     ULONG seq;
     int iterations = 0;
     LARGE_INTEGER batchWait;
+    LONG waiters;
 
     if (!Vcb)
         return STATUS_SUCCESS;
@@ -1226,18 +1245,21 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
     mutex_unlock(&journal->j_checkpoint_mutex);
 
     /*
-     * fsync batching (Linux jbd2 max_batch_time): give concurrent fsync /
-     * FlushFileBuffers callers a short window to attach more dirty metadata
-     * to the same pending handle before we cancel the long batch timer and
-     * force kjournald.  One commit then covers N files (Explorer copy).
+     * fsync batching (Linux jbd2 max_batch_time): only delay when another
+     * force-commit is already waiting so solo fsync is not taxed 15ms.
+     * Concurrent FlushFileBuffers then join one commit (Explorer copy).
      */
-    batchWait.QuadPart = (LONGLONG)-10 * 1000 * EXT2_FSYNC_BATCH_MS;
-    KeDelayExecutionThread(KernelMode, FALSE, &batchWait);
+    waiters = InterlockedIncrement(&Vcb->JournalForceWaiters);
+    if (waiters > 1) {
+        batchWait.QuadPart = (LONGLONG)-10 * 1000 * EXT2_FSYNC_BATCH_MS;
+        KeDelayExecutionThread(KernelMode, FALSE, &batchWait);
+    }
 
     /* Re-check after the batch window — another forcer may have drained. */
     mutex_lock(&journal->j_checkpoint_mutex);
     if (!Vcb->PendingJournalHandle && Vcb->JournalCommitActive == 0) {
         mutex_unlock(&journal->j_checkpoint_mutex);
+        InterlockedDecrement(&Vcb->JournalForceWaiters);
         return STATUS_SUCCESS;
     }
     mutex_unlock(&journal->j_checkpoint_mutex);
@@ -1269,15 +1291,21 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
             iterations++;
         }
 
-        if (Vcb->JournalCommittedSeq == seq)
+        if (Vcb->JournalCommittedSeq == seq) {
+            InterlockedDecrement(&Vcb->JournalForceWaiters);
             return STATUS_IO_TIMEOUT;
+        }
 
-        if (Vcb->JournalCommitError)
-            return Ext2WinntError(Vcb->JournalCommitError);
+        if (Vcb->JournalCommitError) {
+            NTSTATUS st = Ext2WinntError(Vcb->JournalCommitError);
+            InterlockedDecrement(&Vcb->JournalForceWaiters);
+            return st;
+        }
 
         mutex_lock(&journal->j_checkpoint_mutex);
         if (!Vcb->PendingJournalHandle && Vcb->JournalCommitActive == 0) {
             mutex_unlock(&journal->j_checkpoint_mutex);
+            InterlockedDecrement(&Vcb->JournalForceWaiters);
             return STATUS_SUCCESS;
         }
         mutex_unlock(&journal->j_checkpoint_mutex);
@@ -1286,5 +1314,6 @@ Ext2JournalForceCommit(PEXT2_VCB Vcb)
         KeSetEvent(&Vcb->KjournaldWake, 0, FALSE);
     }
 
+    InterlockedDecrement(&Vcb->JournalForceWaiters);
     return STATUS_IO_TIMEOUT;
 }

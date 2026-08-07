@@ -819,6 +819,10 @@ typedef struct _EXT2_VCB {
      * reports commit failures instead of swallowing them. */
     volatile LONG               JournalCommitError;
 
+    /* Concurrent Ext2JournalForceCommit waiters.  The 15ms fsync batch
+     * delay runs only when more than one forcer is present. */
+    volatile LONG               JournalForceWaiters;
+
     /* Maximum file size in blocks ... */
     ULONG                       max_blocks_per_layer[EXT2_BLOCK_TYPES];
     ULONG                       max_data_blocks;
@@ -2790,6 +2794,12 @@ Ext2MarkOrderedDirtyRange(
 
 VOID
 Ext2ResetOrderedDirtyRanges(IN PEXT2_FCB Fcb);
+
+/* Flush FCB ordered dirty ranges (or full file if empty).  On success
+ * clears the range list; on failure restores ranges.  Does not touch
+ * FCB_FILE_MODIFIED — callers clear that only after durable commit. */
+NTSTATUS
+Ext2FlushFcbOrderedData(IN PEXT2_FCB Fcb);
 
 VOID
 Ext2InsertFcb(PEXT2_VCB Vcb, PEXT2_FCB Fcb);

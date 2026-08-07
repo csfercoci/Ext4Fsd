@@ -10,9 +10,12 @@ rem  Usage:   build.cmd [Configuration] [Platform]
 rem           Configuration : Debug (default) | Release
 rem           Platform      : x64 (default) | Win32/x86 | ARM | ARM64
 rem
-rem  Output:  Ext4Fsd\<Configuration>\<Platform>\Ext2Fsd.sys
-rem           Ext2Mgr\<Configuration>\<Platform>\Ext2Mgr.exe
-rem           Ext2Srv\<Configuration>\<Platform>\Ext2Srv.exe
+rem  Output:  Ext4Fsd\<Configuration>\<OutPlatform>\Ext2Fsd.sys
+rem           (OutPlatform: x64 | x86 | arm | arm64)
+rem           Ext2Mgr\<Configuration>\<OutPlatform>\Ext2Mgr.exe
+rem           Ext2Srv\<Configuration>\<OutPlatform>\Ext2Srv.exe
+rem
+rem  install.cmd defaults match: Debug|x64 and the same OutPlatform map.
 rem ============================================================================
 setlocal EnableExtensions
 
